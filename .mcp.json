@@ -1,0 +1,28 @@
+{
+  "mcpServers": {
+    "agentic-memory": {
+      "command": "python",
+      "args": ["mcp_server.py"],
+      "cwd": ".",
+      "env": {
+        "MEMORY_BACKEND": "sqlite",
+        "SQLITE_DB_PATH": "agentic_memory.db",
+        "EMBEDDING_BACKEND": "hash",
+        "LLM_PROVIDER": "deterministic"
+      }
+    }
+  },
+  "_comment": {
+    "postgres_variant": {
+      "command": "python",
+      "args": ["mcp_server.py"],
+      "cwd": ".",
+      "env": {
+        "MEMORY_BACKEND": "postgres",
+        "POSTGRES_DSN": "postgresql://postgres:postgres@localhost:5432/agentic_memory",
+        "EMBEDDING_BACKEND": "sentence-transformer",
+        "LLM_PROVIDER": "deterministic"
+      }
+    }
+  }
+}
