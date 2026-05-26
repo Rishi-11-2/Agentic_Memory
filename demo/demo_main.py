@@ -14,7 +14,6 @@ from pathlib import Path
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
 from config import configure_logging
-from core.access_scope import AccessScope
 from core.memory_service import AgenticMemoryService
 from model.embedding_model import HashEmbeddingModel
 from model.groq_client import DeterministicStructuredClient
@@ -43,14 +42,13 @@ async def run_demo() -> None:
         actor=Actor(llm_client, "deterministic-actor", registry),
         critic=Critic(llm_client, "deterministic-critic"),
     )
-    scope = AccessScope(application_id="demo", tenant_id="tenant", user_id="user")
     prompts = [
         "I prefer concise bullet-style answers. Calculate 21 * 2.",
         "Search the web for agentic memory patterns.",
         "Calculate 10 + 5 and search the web for the latest memory workflow.",
     ]
     for prompt in prompts:
-        result = await loop.run_turn(prompt, "demo-session", scope)
+        result = await loop.run_turn(prompt, "demo-session")
         print(result.model_dump_json(indent=2))
 
     await store.close()

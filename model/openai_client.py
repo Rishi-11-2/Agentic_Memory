@@ -12,11 +12,8 @@ from typing import Any, TypeVar, cast
 from pydantic import BaseModel
 
 from core.models import LLMMessage
-from model.circuit_breaker import SimpleCircuitBreaker
-
 ModelT = TypeVar("ModelT", bound=BaseModel)
 logger = logging.getLogger(__name__)
-_OPENAI_CIRCUIT_BREAKER = SimpleCircuitBreaker()
 
 
 class OpenAIStructuredClient:
@@ -54,7 +51,6 @@ class OpenAIStructuredClient:
 
         last_error: Exception | None = None
         for attempt in range(1, self._max_attempts + 1):
-            _OPENAI_CIRCUIT_BREAKER.before_call()
             try:
                 response = await self._client.chat.completions.create(
                     model=model,
@@ -73,16 +69,13 @@ class OpenAIStructuredClient:
                     },
                 )
                 parsed = _parse_structured_json(content, response_model)
-                _OPENAI_CIRCUIT_BREAKER.record_success()
                 return parsed
             except RateLimitError as exc:
                 last_error = exc
-                _OPENAI_CIRCUIT_BREAKER.record_failure()
                 logger.warning("openai_rate_limit_retry", extra={"attempt": attempt, "model": model}, exc_info=exc)
                 if attempt < self._max_attempts:
                     await asyncio.sleep(2.0)
             except Exception as exc:
-                _OPENAI_CIRCUIT_BREAKER.record_failure()
                 raise RuntimeError("OpenAI structured completion failed") from exc
         raise RuntimeError(f"OpenAI structured completion failed after {self._max_attempts} attempts") from last_error
 

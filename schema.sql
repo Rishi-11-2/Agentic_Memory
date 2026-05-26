@@ -4,28 +4,19 @@
 create extension if not exists vector;
 create extension if not exists pgcrypto;
 
-create or replace function am_scope_hash(application_id text, tenant_id text, user_id text)
-returns text
-language sql immutable
-as $$
-    select encode(digest(application_id || tenant_id || user_id, 'sha256'), 'hex');
-$$;
-
 create table if not exists am_conversation_turns (
     id uuid primary key default gen_random_uuid(),
-    scope_hash text not null,
     session_id text not null,
     turn_index integer not null check (turn_index >= 0),
     role text not null check (role in ('user', 'assistant')),
     content text not null,
     token_count integer not null default 0 check (token_count >= 0),
     timestamp timestamptz not null default now(),
-    unique (scope_hash, session_id, turn_index, role)
+    unique (session_id, turn_index, role)
 );
 
 create table if not exists am_conversation_summaries (
     summary_id uuid primary key default gen_random_uuid(),
-    scope_hash text not null,
     session_id text not null,
     start_turn_index integer not null,
     end_turn_index integer not null,
@@ -37,7 +28,6 @@ create table if not exists am_conversation_summaries (
 
 create table if not exists am_episodic_memory (
     episode_id uuid primary key default gen_random_uuid(),
-    scope_hash text not null,
     prompt_text text not null,
     prompt_embedding vector(384),
     prompt_embedding_hash vector(256),
@@ -51,7 +41,6 @@ create table if not exists am_episodic_memory (
 
 create table if not exists am_failure_episodes (
     failure_id uuid primary key default gen_random_uuid(),
-    scope_hash text not null,
     episode_id uuid references am_episodic_memory(episode_id) on delete set null,
     prompt_text text not null,
     prompt_embedding vector(384),
@@ -65,7 +54,6 @@ create table if not exists am_failure_episodes (
 
 create table if not exists am_semantic_memory (
     fact_id uuid primary key default gen_random_uuid(),
-    scope_hash text not null,
     fact_type text not null check (fact_type in ('preference', 'inferred_fact', 'system_rule')),
     content text not null,
     embedding vector(384),
@@ -93,8 +81,7 @@ alter table am_semantic_memory
 
 create table if not exists am_procedural_workflows (
     workflow_id uuid primary key default gen_random_uuid(),
-    scope_hash text not null,
-    workflow_signature text not null,
+    workflow_signature text not null unique,
     trigger_phrases text[] not null default '{}',
     tool_sequence jsonb not null default '[]'::jsonb,
     success_count integer not null default 1 check (success_count >= 1),
@@ -103,15 +90,14 @@ create table if not exists am_procedural_workflows (
     embedding vector(384),
     hash_embedding vector(256),
     created_at timestamptz not null default now(),
-    updated_at timestamptz not null default now(),
-    unique (scope_hash, workflow_signature)
+    updated_at timestamptz not null default now()
 );
 
-create index if not exists am_conversation_scope_session_idx
-    on am_conversation_turns (scope_hash, session_id, turn_index desc, timestamp desc);
+create index if not exists am_conversation_session_idx
+    on am_conversation_turns (session_id, turn_index desc, timestamp desc);
 
-create index if not exists am_summaries_scope_session_idx
-    on am_conversation_summaries (scope_hash, session_id, created_at desc);
+create index if not exists am_summaries_session_idx
+    on am_conversation_summaries (session_id, created_at desc);
 
 create index if not exists am_episodic_tool_sequence_gin_idx
     on am_episodic_memory using gin (tool_sequence);
@@ -157,15 +143,15 @@ create index if not exists am_procedural_hash_embedding_ivfflat_idx
     on am_procedural_workflows using ivfflat (hash_embedding vector_cosine_ops) with (lists = 100)
     where hash_embedding is not null;
 
+-- Match functions for server-side vector search
+
 create or replace function match_semantic_memory(
     query_embedding vector,
-    scope_hash text,
     threshold float,
     "limit" int
 )
 returns table (
     fact_id uuid,
-    scope_hash text,
     fact_type text,
     content text,
     confidence_score double precision,
@@ -180,7 +166,6 @@ language sql stable
 as $$
     select
         m.fact_id,
-        m.scope_hash,
         m.fact_type,
         m.content,
         m.confidence_score,
@@ -191,22 +176,19 @@ as $$
         m.last_confirmed_at,
         1 - (m.embedding <=> $1) as similarity
     from am_semantic_memory m
-    where m.scope_hash = $2
-      and m.embedding is not null
-      and 1 - (m.embedding <=> $1) >= $3
+    where m.embedding is not null
+      and 1 - (m.embedding <=> $1) >= $2
     order by m.embedding <=> $1
-    limit $4;
+    limit $3;
 $$;
 
 create or replace function match_episodic_memory(
     query_embedding vector,
-    scope_hash text,
     threshold float,
     "limit" int
 )
 returns table (
     episode_id uuid,
-    scope_hash text,
     prompt_text text,
     tool_sequence jsonb,
     final_response text,
@@ -220,7 +202,6 @@ language sql stable
 as $$
     select
         e.episode_id,
-        e.scope_hash,
         e.prompt_text,
         e.tool_sequence,
         e.final_response,
@@ -230,22 +211,19 @@ as $$
         e.timestamp,
         1 - (e.prompt_embedding <=> $1) as similarity
     from am_episodic_memory e
-    where e.scope_hash = $2
-      and e.prompt_embedding is not null
-      and 1 - (e.prompt_embedding <=> $1) >= $3
+    where e.prompt_embedding is not null
+      and 1 - (e.prompt_embedding <=> $1) >= $2
     order by e.prompt_embedding <=> $1
-    limit $4;
+    limit $3;
 $$;
 
 create or replace function match_failure_episodes(
     query_embedding vector,
-    scope_hash text,
     threshold float,
     "limit" int
 )
 returns table (
     failure_id uuid,
-    scope_hash text,
     episode_id uuid,
     prompt_text text,
     tool_name text,
@@ -259,7 +237,6 @@ language sql stable
 as $$
     select
         f.failure_id,
-        f.scope_hash,
         f.episode_id,
         f.prompt_text,
         f.tool_name,
@@ -269,22 +246,19 @@ as $$
         f.timestamp,
         1 - (f.prompt_embedding <=> $1) as similarity
     from am_failure_episodes f
-    where f.scope_hash = $2
-      and f.prompt_embedding is not null
-      and 1 - (f.prompt_embedding <=> $1) >= $3
+    where f.prompt_embedding is not null
+      and 1 - (f.prompt_embedding <=> $1) >= $2
     order by f.prompt_embedding <=> $1
-    limit $4;
+    limit $3;
 $$;
 
 create or replace function match_procedural_workflows(
     query_embedding vector,
-    scope_hash text,
     threshold float,
     "limit" int
 )
 returns table (
     workflow_id uuid,
-    scope_hash text,
     workflow_signature text,
     trigger_phrases text[],
     tool_sequence jsonb,
@@ -299,7 +273,6 @@ language sql stable
 as $$
     select
         p.workflow_id,
-        p.scope_hash,
         p.workflow_signature,
         p.trigger_phrases,
         p.tool_sequence,
@@ -310,69 +283,8 @@ as $$
         p.updated_at,
         1 - (p.embedding <=> $1) as similarity
     from am_procedural_workflows p
-    where p.scope_hash = $2
-      and p.embedding is not null
-      and 1 - (p.embedding <=> $1) >= $3
+    where p.embedding is not null
+      and 1 - (p.embedding <=> $1) >= $2
     order by p.embedding <=> $1
-    limit $4;
+    limit $3;
 $$;
-
-alter table am_conversation_turns enable row level security;
-alter table am_conversation_summaries enable row level security;
-alter table am_episodic_memory enable row level security;
-alter table am_failure_episodes enable row level security;
-alter table am_semantic_memory enable row level security;
-alter table am_procedural_workflows enable row level security;
-
-create or replace function am_jwt_scope_hash()
-returns text
-language sql stable
-as $$
-    select coalesce(
-        auth.jwt() ->> 'scope_hash',
-        nullif(current_setting('request.jwt.claim.scope_hash', true), '')
-    );
-$$;
-
-drop policy if exists "scope read conversation" on am_conversation_turns;
-drop policy if exists "scope write conversation" on am_conversation_turns;
-drop policy if exists "scope read summaries" on am_conversation_summaries;
-drop policy if exists "scope write summaries" on am_conversation_summaries;
-drop policy if exists "scope read episodic" on am_episodic_memory;
-drop policy if exists "scope write episodic" on am_episodic_memory;
-drop policy if exists "scope read failures" on am_failure_episodes;
-drop policy if exists "scope write failures" on am_failure_episodes;
-drop policy if exists "scope read semantic" on am_semantic_memory;
-drop policy if exists "scope write semantic" on am_semantic_memory;
-drop policy if exists "scope read procedural" on am_procedural_workflows;
-drop policy if exists "scope write procedural" on am_procedural_workflows;
-
-create policy "scope read conversation" on am_conversation_turns
-    for select using (scope_hash = am_jwt_scope_hash());
-create policy "scope write conversation" on am_conversation_turns
-    for all using (scope_hash = am_jwt_scope_hash()) with check (scope_hash = am_jwt_scope_hash());
-
-create policy "scope read summaries" on am_conversation_summaries
-    for select using (scope_hash = am_jwt_scope_hash());
-create policy "scope write summaries" on am_conversation_summaries
-    for all using (scope_hash = am_jwt_scope_hash()) with check (scope_hash = am_jwt_scope_hash());
-
-create policy "scope read episodic" on am_episodic_memory
-    for select using (scope_hash = am_jwt_scope_hash());
-create policy "scope write episodic" on am_episodic_memory
-    for all using (scope_hash = am_jwt_scope_hash()) with check (scope_hash = am_jwt_scope_hash());
-
-create policy "scope read failures" on am_failure_episodes
-    for select using (scope_hash = am_jwt_scope_hash());
-create policy "scope write failures" on am_failure_episodes
-    for all using (scope_hash = am_jwt_scope_hash()) with check (scope_hash = am_jwt_scope_hash());
-
-create policy "scope read semantic" on am_semantic_memory
-    for select using (scope_hash = am_jwt_scope_hash());
-create policy "scope write semantic" on am_semantic_memory
-    for all using (scope_hash = am_jwt_scope_hash()) with check (scope_hash = am_jwt_scope_hash());
-
-create policy "scope read procedural" on am_procedural_workflows
-    for select using (scope_hash = am_jwt_scope_hash());
-create policy "scope write procedural" on am_procedural_workflows
-    for all using (scope_hash = am_jwt_scope_hash()) with check (scope_hash = am_jwt_scope_hash());

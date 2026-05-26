@@ -10,7 +10,6 @@ from typing import Any, Literal
 from fastmcp import FastMCP
 
 from config import Settings, load_settings
-from core.access_scope import AccessScope
 from core.memory_service import AgenticMemoryService
 from core.models import ActorResult, CriticEvaluation, MemoryLayer, NewSemanticFact, SemanticFactType, ToolInvocation
 from model.embedding_model import EmbeddingModel, create_embedding_model
@@ -38,14 +37,10 @@ class MCPComponents:
 async def get_session_context(
     user_message: str,
     session_id: str,
-    application_id: str,
-    tenant_id: str,
-    user_id: str,
 ) -> str:
-    """Build the memory context prompt for a session before Claude Code generates a response."""
+    """Build the memory context prompt for a session before the AI agent generates a response."""
     components = await _components()
-    scope = AccessScope(application_id=application_id, tenant_id=tenant_id, user_id=user_id)
-    plan = await components.planner.plan(user_message, scope, session_id)
+    plan = await components.planner.plan(user_message, session_id)
     context = await components.memory_service.build_context(plan)
     return context.rendered_context
 
@@ -53,9 +48,6 @@ async def get_session_context(
 @mcp.tool()
 async def consolidate_turn(
     session_id: str,
-    application_id: str,
-    tenant_id: str,
-    user_id: str,
     user_message: str,
     assistant_response: str,
     critic_score: float,
@@ -66,10 +58,9 @@ async def consolidate_turn(
     tool_calls_json: str,
     failure_summary: str | None,
 ) -> str:
-    """Persist one completed Claude Code turn into conversational, episodic, semantic, and procedural memory."""
+    """Persist one completed turn into conversational, episodic, semantic, and procedural memory."""
     del workflow_name
     components = await _components()
-    scope = AccessScope(application_id=application_id, tenant_id=tenant_id, user_id=user_id)
     parsed_tool_calls = json.loads(tool_calls_json) if tool_calls_json.strip() else []
     if not isinstance(parsed_tool_calls, list):
         raise ValueError("tool_calls_json must decode to a JSON array")
@@ -100,7 +91,6 @@ async def consolidate_turn(
         prompt=user_message,
         actor_result=actor_result,
         critic_evaluation=critic_evaluation,
-        scope=scope,
         session_id=session_id,
         loop_latency_ms=0,
     )
@@ -113,21 +103,16 @@ async def consolidate_turn(
 @mcp.tool()
 async def search_memory(
     query: str,
-    application_id: str,
-    tenant_id: str,
-    user_id: str,
     layers: list[Literal["semantic", "episodic", "procedural", "failure"]] | None = None,
     top_k: int = 5,
 ) -> str:
-    """Search selected memory layers for scoped records relevant to a query."""
+    """Search selected memory layers for records relevant to a query."""
     components = await _components()
-    scope = AccessScope(application_id=application_id, tenant_id=tenant_id, user_id=user_id)
     selected = layers or ["semantic", "episodic", "procedural", "failure"]
     embedding = await components.embedding_model.embed(query)
     result: dict[str, Any] = {}
     if "semantic" in selected:
         semantic_records = await components.store.search_semantic(
-            scope.scope_hash,
             embedding,
             top_k,
             0.0,
@@ -136,13 +121,13 @@ async def search_memory(
         )
         result["semantic"] = [record.model_dump(mode="json") for record in semantic_records]
     if "episodic" in selected:
-        episodic_records = await components.store.search_episodes(scope.scope_hash, embedding, top_k, 0.0)
+        episodic_records = await components.store.search_episodes(embedding, top_k, 0.0)
         result["episodic"] = [record.model_dump(mode="json") for record in episodic_records]
     if "procedural" in selected:
-        procedural_records = await components.store.search_procedural(scope.scope_hash, embedding, top_k, 0.0)
+        procedural_records = await components.store.search_procedural(embedding, top_k, 0.0)
         result["procedural"] = [record.model_dump(mode="json") for record in procedural_records]
     if "failure" in selected:
-        failure_records = await components.store.search_failures(scope.scope_hash, embedding, top_k, 0.0)
+        failure_records = await components.store.search_failures(embedding, top_k, 0.0)
         result["failure"] = [record.model_dump(mode="json") for record in failure_records]
     return json.dumps(result, ensure_ascii=False)
 
@@ -150,15 +135,11 @@ async def search_memory(
 @mcp.tool()
 async def get_conversation_history(
     session_id: str,
-    application_id: str,
-    tenant_id: str,
-    user_id: str,
     last_n: int = 10,
 ) -> str:
-    """Return recent conversation messages for one scoped session."""
+    """Return recent conversation messages for a session."""
     components = await _components()
-    scope = AccessScope(application_id=application_id, tenant_id=tenant_id, user_id=user_id)
-    records = await components.store.get_conversation_turns(scope.scope_hash, session_id, last_n)
+    records = await components.store.get_conversation_turns(session_id, last_n)
     return json.dumps(
         [
             {"role": record.role.value, "content": record.content, "timestamp": record.timestamp.isoformat()}
@@ -171,38 +152,29 @@ async def get_conversation_history(
 @mcp.tool()
 async def clear_session_memory(
     session_id: str,
-    application_id: str,
-    tenant_id: str,
-    user_id: str,
 ) -> str:
-    """Clear only conversational memory for one scoped session, leaving durable memories intact."""
+    """Clear only conversational memory for a session, leaving durable memories intact."""
     components = await _components()
-    scope = AccessScope(application_id=application_id, tenant_id=tenant_id, user_id=user_id)
-    await components.store.clear_conversation(scope.scope_hash, session_id)
+    await components.store.clear_conversation(session_id)
     return json.dumps({"cleared": True, "session_id": session_id}, ensure_ascii=False)
 
 
 @mcp.tool()
 async def inspect_memory_layers(
-    application_id: str,
-    tenant_id: str,
-    user_id: str,
     limit: int = 20,
 ) -> str:
     """Summarize all memory layers for debugging or admin UI inspection."""
     components = await _components()
-    scope = AccessScope(application_id=application_id, tenant_id=tenant_id, user_id=user_id)
     counts = {
-        layer.value: await components.store.count_layer(scope.scope_hash, layer)
+        layer.value: await components.store.count_layer(layer)
         for layer in (MemoryLayer.CONVERSATIONAL, MemoryLayer.EPISODIC, MemoryLayer.SEMANTIC, MemoryLayer.PROCEDURAL)
     }
-    counts["failure"] = await components.store.count_layer(scope.scope_hash, MemoryLayer.FAILURE)
-    semantic = await components.store.inspect_layer(scope.scope_hash, MemoryLayer.SEMANTIC, 3, 0)
-    episodes = await components.store.inspect_layer(scope.scope_hash, MemoryLayer.EPISODIC, 3, 0)
-    workflows = await components.store.inspect_layer(scope.scope_hash, MemoryLayer.PROCEDURAL, limit, 0)
+    counts["failure"] = await components.store.count_layer(MemoryLayer.FAILURE)
+    semantic = await components.store.inspect_layer(MemoryLayer.SEMANTIC, 3, 0)
+    episodes = await components.store.inspect_layer(MemoryLayer.EPISODIC, 3, 0)
+    workflows = await components.store.inspect_layer(MemoryLayer.PROCEDURAL, limit, 0)
     return json.dumps(
         {
-            "scope_hash": scope.scope_hash,
             "counts": counts,
             "recent_semantic_facts": semantic,
             "recent_episodes": episodes,

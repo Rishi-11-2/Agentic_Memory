@@ -34,19 +34,17 @@ from store.base import MemoryStore
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS am_conversation_turns (
     id TEXT PRIMARY KEY,
-    scope_hash TEXT NOT NULL,
     session_id TEXT NOT NULL,
     turn_index INTEGER NOT NULL CHECK (turn_index >= 0),
     role TEXT NOT NULL CHECK (role IN ('user', 'assistant')),
     content TEXT NOT NULL,
     token_count INTEGER NOT NULL DEFAULT 0,
     timestamp TEXT NOT NULL,
-    UNIQUE (scope_hash, session_id, turn_index, role)
+    UNIQUE (session_id, turn_index, role)
 );
 
 CREATE TABLE IF NOT EXISTS am_conversation_summaries (
     summary_id TEXT PRIMARY KEY,
-    scope_hash TEXT NOT NULL,
     session_id TEXT NOT NULL,
     start_turn_index INTEGER NOT NULL,
     end_turn_index INTEGER NOT NULL,
@@ -57,7 +55,6 @@ CREATE TABLE IF NOT EXISTS am_conversation_summaries (
 
 CREATE TABLE IF NOT EXISTS am_episodic_memory (
     episode_id TEXT PRIMARY KEY,
-    scope_hash TEXT NOT NULL,
     prompt_text TEXT NOT NULL,
     prompt_embedding TEXT,
     tool_sequence TEXT NOT NULL DEFAULT '[]',
@@ -70,7 +67,6 @@ CREATE TABLE IF NOT EXISTS am_episodic_memory (
 
 CREATE TABLE IF NOT EXISTS am_failure_episodes (
     failure_id TEXT PRIMARY KEY,
-    scope_hash TEXT NOT NULL,
     episode_id TEXT,
     prompt_text TEXT NOT NULL,
     prompt_embedding TEXT,
@@ -83,7 +79,6 @@ CREATE TABLE IF NOT EXISTS am_failure_episodes (
 
 CREATE TABLE IF NOT EXISTS am_semantic_memory (
     fact_id TEXT PRIMARY KEY,
-    scope_hash TEXT NOT NULL,
     fact_type TEXT NOT NULL CHECK (fact_type IN ('preference', 'inferred_fact', 'system_rule')),
     content TEXT NOT NULL,
     embedding TEXT,
@@ -97,8 +92,7 @@ CREATE TABLE IF NOT EXISTS am_semantic_memory (
 
 CREATE TABLE IF NOT EXISTS am_procedural_workflows (
     workflow_id TEXT PRIMARY KEY,
-    scope_hash TEXT NOT NULL,
-    workflow_signature TEXT NOT NULL,
+    workflow_signature TEXT NOT NULL UNIQUE,
     trigger_phrases TEXT NOT NULL DEFAULT '[]',
     tool_sequence TEXT NOT NULL DEFAULT '[]',
     success_count INTEGER NOT NULL DEFAULT 1,
@@ -106,16 +100,11 @@ CREATE TABLE IF NOT EXISTS am_procedural_workflows (
     avg_latency_ms REAL NOT NULL DEFAULT 0.0,
     embedding TEXT,
     created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL,
-    UNIQUE (scope_hash, workflow_signature)
+    updated_at TEXT NOT NULL
 );
 
-CREATE INDEX IF NOT EXISTS idx_conv_scope_session ON am_conversation_turns (scope_hash, session_id, turn_index DESC);
-CREATE INDEX IF NOT EXISTS idx_summ_scope_session ON am_conversation_summaries (scope_hash, session_id, created_at DESC);
-CREATE INDEX IF NOT EXISTS idx_episodic_scope ON am_episodic_memory (scope_hash);
-CREATE INDEX IF NOT EXISTS idx_failure_scope ON am_failure_episodes (scope_hash);
-CREATE INDEX IF NOT EXISTS idx_semantic_scope ON am_semantic_memory (scope_hash);
-CREATE INDEX IF NOT EXISTS idx_procedural_scope ON am_procedural_workflows (scope_hash);
+CREATE INDEX IF NOT EXISTS idx_conv_session ON am_conversation_turns (session_id, turn_index DESC);
+CREATE INDEX IF NOT EXISTS idx_summ_session ON am_conversation_summaries (session_id, created_at DESC);
 """
 
 
@@ -147,11 +136,11 @@ class SQLiteMemoryStore(MemoryStore):
 
     # ── Conversational ──────────────────────────────────────────────
 
-    async def next_turn_index(self, scope_hash: str, session_id: str) -> int:
-        """Return the next turn index for the scoped session."""
+    async def next_turn_index(self, session_id: str) -> int:
+        """Return the next turn index for the session."""
         cursor = await self._db.execute(
-            "SELECT MAX(turn_index) FROM am_conversation_turns WHERE scope_hash = ? AND session_id = ?",
-            (scope_hash, session_id),
+            "SELECT MAX(turn_index) FROM am_conversation_turns WHERE session_id = ?",
+            (session_id,),
         )
         row = await cursor.fetchone()
         if row is None or row[0] is None:
@@ -161,72 +150,72 @@ class SQLiteMemoryStore(MemoryStore):
     async def append_conversation_message(self, record: ConversationalTurnRecord) -> ConversationalTurnRecord:
         """Append one user or assistant message to conversational memory."""
         await self._db.execute(
-            "INSERT INTO am_conversation_turns (id, scope_hash, session_id, turn_index, role, content, token_count, timestamp) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (record.id, record.scope_hash, record.session_id, record.turn_index,
+            "INSERT INTO am_conversation_turns (id, session_id, turn_index, role, content, token_count, timestamp) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (record.id, record.session_id, record.turn_index,
              record.role.value, record.content, record.token_count, record.timestamp.isoformat()),
         )
         await self._db.commit()
         return record
 
-    async def recent_conversation(self, scope_hash: str, session_id: str, limit: int) -> list[ConversationalTurnRecord]:
+    async def recent_conversation(self, session_id: str, limit: int) -> list[ConversationalTurnRecord]:
         """Return recent conversational messages for the active session."""
         cursor = await self._db.execute(
-            "SELECT * FROM am_conversation_turns WHERE scope_hash = ? AND session_id = ? "
+            "SELECT * FROM am_conversation_turns WHERE session_id = ? "
             "ORDER BY turn_index DESC, timestamp DESC LIMIT ?",
-            (scope_hash, session_id, limit),
+            (session_id, limit),
         )
         rows = await cursor.fetchall()
         return list(reversed([self._conv_from_row(row) for row in rows]))
 
     async def get_conversation_turns(
-        self, scope_hash: str, session_id: str, limit: int
+        self, session_id: str, limit: int
     ) -> list[ConversationalTurnRecord]:
         """Return recent conversational messages in chronological order."""
-        return await self.recent_conversation(scope_hash, session_id, limit)
+        return await self.recent_conversation(session_id, limit)
 
     async def conversation_turn(
-        self, scope_hash: str, session_id: str, turn_index: int
+        self, session_id: str, turn_index: int
     ) -> list[ConversationalTurnRecord]:
         """Return all role records for one session turn index."""
         cursor = await self._db.execute(
-            "SELECT * FROM am_conversation_turns WHERE scope_hash = ? AND session_id = ? AND turn_index = ? "
+            "SELECT * FROM am_conversation_turns WHERE session_id = ? AND turn_index = ? "
             "ORDER BY timestamp",
-            (scope_hash, session_id, turn_index),
+            (session_id, turn_index),
         )
         rows = await cursor.fetchall()
         return [self._conv_from_row(row) for row in rows]
 
-    async def clear_conversation(self, scope_hash: str, session_id: str) -> int:
-        """Delete raw conversation and summaries for one scoped session."""
+    async def clear_conversation(self, session_id: str) -> int:
+        """Delete raw conversation and summaries for one session."""
         turns_cursor = await self._db.execute(
-            "DELETE FROM am_conversation_turns WHERE scope_hash = ? AND session_id = ?",
-            (scope_hash, session_id),
+            "DELETE FROM am_conversation_turns WHERE session_id = ?",
+            (session_id,),
         )
         summaries_cursor = await self._db.execute(
-            "DELETE FROM am_conversation_summaries WHERE scope_hash = ? AND session_id = ?",
-            (scope_hash, session_id),
+            "DELETE FROM am_conversation_summaries WHERE session_id = ?",
+            (session_id,),
         )
         await self._db.commit()
         return (turns_cursor.rowcount or 0) + (summaries_cursor.rowcount or 0)
 
     async def conversation_before_turn(
-        self, scope_hash: str, session_id: str, before_turn_index: int
+        self, session_id: str, before_turn_index: int
     ) -> list[ConversationalTurnRecord]:
         """Return conversation messages old enough to be summarized and pruned."""
         cursor = await self._db.execute(
-            "SELECT * FROM am_conversation_turns WHERE scope_hash = ? AND session_id = ? AND turn_index < ? "
+            "SELECT * FROM am_conversation_turns WHERE session_id = ? AND turn_index < ? "
             "ORDER BY turn_index, timestamp",
-            (scope_hash, session_id, before_turn_index),
+            (session_id, before_turn_index),
         )
         rows = await cursor.fetchall()
         return [self._conv_from_row(row) for row in rows]
 
-    async def delete_conversation_before_turn(self, scope_hash: str, session_id: str, before_turn_index: int) -> int:
+    async def delete_conversation_before_turn(self, session_id: str, before_turn_index: int) -> int:
         """Delete raw conversation messages that have been safely summarized."""
         cursor = await self._db.execute(
-            "DELETE FROM am_conversation_turns WHERE scope_hash = ? AND session_id = ? AND turn_index < ?",
-            (scope_hash, session_id, before_turn_index),
+            "DELETE FROM am_conversation_turns WHERE session_id = ? AND turn_index < ?",
+            (session_id, before_turn_index),
         )
         await self._db.commit()
         return cursor.rowcount or 0
@@ -234,20 +223,20 @@ class SQLiteMemoryStore(MemoryStore):
     async def save_conversation_summary(self, summary: ConversationalSummary) -> ConversationalSummary:
         """Persist a rolling conversational summary."""
         await self._db.execute(
-            "INSERT INTO am_conversation_summaries (summary_id, scope_hash, session_id, start_turn_index, end_turn_index, summary, token_count, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (summary.summary_id, summary.scope_hash, summary.session_id, summary.start_turn_index,
+            "INSERT INTO am_conversation_summaries (summary_id, session_id, start_turn_index, end_turn_index, summary, token_count, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (summary.summary_id, summary.session_id, summary.start_turn_index,
              summary.end_turn_index, summary.summary, summary.token_count, summary.created_at.isoformat()),
         )
         await self._db.commit()
         return summary
 
-    async def recent_summaries(self, scope_hash: str, session_id: str, limit: int) -> list[ConversationalSummary]:
+    async def recent_summaries(self, session_id: str, limit: int) -> list[ConversationalSummary]:
         """Return recent summaries for context assembly."""
         cursor = await self._db.execute(
-            "SELECT * FROM am_conversation_summaries WHERE scope_hash = ? AND session_id = ? "
+            "SELECT * FROM am_conversation_summaries WHERE session_id = ? "
             "ORDER BY created_at DESC LIMIT ?",
-            (scope_hash, session_id, limit),
+            (session_id, limit),
         )
         rows = await cursor.fetchall()
         return [self._summary_from_row(row) for row in rows]
@@ -257,9 +246,9 @@ class SQLiteMemoryStore(MemoryStore):
     async def save_episode(self, episode: EpisodeRecord) -> EpisodeRecord:
         """Persist an append-only episodic memory record."""
         await self._db.execute(
-            "INSERT INTO am_episodic_memory (episode_id, scope_hash, prompt_text, prompt_embedding, tool_sequence, "
-            "final_response, outcome, error_trace, latency_ms, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (episode.episode_id, episode.scope_hash, episode.prompt_text,
+            "INSERT INTO am_episodic_memory (episode_id, prompt_text, prompt_embedding, tool_sequence, "
+            "final_response, outcome, error_trace, latency_ms, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (episode.episode_id, episode.prompt_text,
              json.dumps(episode.prompt_embedding) if episode.prompt_embedding else None,
              json.dumps([tool.model_dump(mode="json") for tool in episode.tool_sequence]),
              episode.final_response, episode.outcome.value, episode.error_trace,
@@ -269,12 +258,10 @@ class SQLiteMemoryStore(MemoryStore):
         return episode
 
     async def search_episodes(
-        self, scope_hash: str, embedding: list[float], limit: int, threshold: float
+        self, embedding: list[float], limit: int, threshold: float
     ) -> list[EpisodeRecord]:
         """Search episodic memory using client-side cosine similarity."""
-        cursor = await self._db.execute(
-            "SELECT * FROM am_episodic_memory WHERE scope_hash = ?", (scope_hash,)
-        )
+        cursor = await self._db.execute("SELECT * FROM am_episodic_memory")
         rows = await cursor.fetchall()
         scored = _rank_rows(rows, embedding, "prompt_embedding", threshold, limit)
         return [self._episode_from_row(row, sim) for row, sim in scored]
@@ -284,9 +271,9 @@ class SQLiteMemoryStore(MemoryStore):
     async def save_failure_episode(self, failure: FailureEpisode) -> FailureEpisode:
         """Persist a detailed failure episode for future avoidance."""
         await self._db.execute(
-            "INSERT INTO am_failure_episodes (failure_id, scope_hash, episode_id, prompt_text, prompt_embedding, "
-            "tool_name, tool_input, exception_message, error_trace, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (failure.failure_id, failure.scope_hash, failure.episode_id, failure.prompt_text,
+            "INSERT INTO am_failure_episodes (failure_id, episode_id, prompt_text, prompt_embedding, "
+            "tool_name, tool_input, exception_message, error_trace, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (failure.failure_id, failure.episode_id, failure.prompt_text,
              json.dumps(failure.prompt_embedding) if failure.prompt_embedding else None,
              failure.tool_name, json.dumps(failure.tool_input),
              failure.exception_message, failure.error_trace, failure.timestamp.isoformat()),
@@ -295,12 +282,10 @@ class SQLiteMemoryStore(MemoryStore):
         return failure
 
     async def search_failures(
-        self, scope_hash: str, embedding: list[float], limit: int, threshold: float
+        self, embedding: list[float], limit: int, threshold: float
     ) -> list[FailureEpisode]:
         """Search past failures using client-side cosine similarity."""
-        cursor = await self._db.execute(
-            "SELECT * FROM am_failure_episodes WHERE scope_hash = ?", (scope_hash,)
-        )
+        cursor = await self._db.execute("SELECT * FROM am_failure_episodes")
         rows = await cursor.fetchall()
         scored = _rank_rows(rows, embedding, "prompt_embedding", threshold, limit)
         return [self._failure_from_row(row, sim) for row, sim in scored]
@@ -310,10 +295,10 @@ class SQLiteMemoryStore(MemoryStore):
     async def insert_semantic(self, record: SemanticMemoryRecord) -> SemanticMemoryRecord:
         """Insert a new deduplicated semantic memory fact."""
         await self._db.execute(
-            "INSERT INTO am_semantic_memory (fact_id, scope_hash, fact_type, content, embedding, confidence_score, "
+            "INSERT INTO am_semantic_memory (fact_id, fact_type, content, embedding, confidence_score, "
             "source, source_episode_id, created_at, last_reinforced_at, last_confirmed_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (record.fact_id, record.scope_hash, record.fact_type.value, record.content,
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (record.fact_id, record.fact_type.value, record.content,
              json.dumps(record.embedding) if record.embedding else None,
              record.confidence_score, record.source, record.source_episode_id,
              record.created_at.isoformat(), record.last_reinforced_at.isoformat(),
@@ -371,7 +356,6 @@ class SQLiteMemoryStore(MemoryStore):
 
     async def search_semantic(
         self,
-        scope_hash: str,
         embedding: list[float],
         limit: int,
         threshold: float,
@@ -379,8 +363,8 @@ class SQLiteMemoryStore(MemoryStore):
         last_confirmed_after: datetime | None = None,
     ) -> list[SemanticMemoryRecord]:
         """Search semantic memory using client-side cosine similarity and confidence filtering."""
-        sql = "SELECT * FROM am_semantic_memory WHERE scope_hash = ? AND confidence_score >= ?"
-        params: list[object] = [scope_hash, min_confidence]
+        sql = "SELECT * FROM am_semantic_memory WHERE confidence_score >= ?"
+        params: list[object] = [min_confidence]
         if last_confirmed_after is not None:
             sql += " AND last_confirmed_at >= ?"
             params.append(last_confirmed_after.isoformat())
@@ -392,23 +376,20 @@ class SQLiteMemoryStore(MemoryStore):
     # ── Procedural ──────────────────────────────────────────────────
 
     async def search_procedural(
-        self, scope_hash: str, embedding: list[float], limit: int, threshold: float
+        self, embedding: list[float], limit: int, threshold: float
     ) -> list[ProceduralWorkflow]:
         """Search procedural workflows using client-side vector similarity."""
-        cursor = await self._db.execute(
-            "SELECT * FROM am_procedural_workflows WHERE scope_hash = ?", (scope_hash,)
-        )
+        cursor = await self._db.execute("SELECT * FROM am_procedural_workflows")
         rows = await cursor.fetchall()
         scored = _rank_rows(rows, embedding, "embedding", threshold, limit)
         return [self._workflow_from_row(row, sim) for row, sim in scored]
 
     async def match_procedural_triggers(
-        self, scope_hash: str, prompt: str, limit: int
+        self, prompt: str, limit: int
     ) -> list[ProceduralWorkflow]:
         """Find workflows whose trigger phrases appear in the current prompt."""
         cursor = await self._db.execute(
-            "SELECT * FROM am_procedural_workflows WHERE scope_hash = ? ORDER BY success_count DESC LIMIT 100",
-            (scope_hash,),
+            "SELECT * FROM am_procedural_workflows ORDER BY success_count DESC LIMIT 100"
         )
         rows = await cursor.fetchall()
         prompt_normalized = prompt.lower()
@@ -424,8 +405,8 @@ class SQLiteMemoryStore(MemoryStore):
     async def upsert_procedural_workflow(self, workflow: ProceduralWorkflow) -> ProceduralWorkflow:
         """Insert or reinforce a procedural workflow by signature."""
         cursor = await self._db.execute(
-            "SELECT * FROM am_procedural_workflows WHERE scope_hash = ? AND workflow_signature = ?",
-            (workflow.scope_hash, workflow.workflow_signature),
+            "SELECT * FROM am_procedural_workflows WHERE workflow_signature = ?",
+            (workflow.workflow_signature,),
         )
         existing_row = await cursor.fetchone()
         if existing_row:
@@ -448,10 +429,10 @@ class SQLiteMemoryStore(MemoryStore):
             return current
 
         await self._db.execute(
-            "INSERT INTO am_procedural_workflows (workflow_id, scope_hash, workflow_signature, trigger_phrases, "
+            "INSERT INTO am_procedural_workflows (workflow_id, workflow_signature, trigger_phrases, "
             "tool_sequence, success_count, status, avg_latency_ms, embedding, created_at, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (workflow.workflow_id, workflow.scope_hash, workflow.workflow_signature,
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (workflow.workflow_id, workflow.workflow_signature,
              json.dumps(workflow.trigger_phrases),
              json.dumps([step.model_dump(mode="json") for step in workflow.tool_sequence]),
              workflow.success_count, workflow.status.value, workflow.avg_latency_ms,
@@ -461,8 +442,8 @@ class SQLiteMemoryStore(MemoryStore):
         await self._db.commit()
         return workflow
 
-    async def inspect_layer(self, scope_hash: str, layer: MemoryLayer, limit: int, offset: int) -> list[dict[str, object]]:
-        """Return raw scoped records for a single memory layer."""
+    async def inspect_layer(self, layer: MemoryLayer, limit: int, offset: int) -> list[dict[str, object]]:
+        """Return raw records for a single memory layer."""
         table_by_layer = {
             MemoryLayer.CONVERSATIONAL: "am_conversation_turns",
             MemoryLayer.EPISODIC: "am_episodic_memory",
@@ -480,14 +461,14 @@ class SQLiteMemoryStore(MemoryStore):
         table = table_by_layer[layer]
         order_column = order_by_layer[layer]
         cursor = await self._db.execute(
-            f"SELECT * FROM {table} WHERE scope_hash = ? ORDER BY {order_column} DESC LIMIT ? OFFSET ?",  # noqa: S608
-            (scope_hash, limit, offset),
+            f"SELECT * FROM {table} ORDER BY {order_column} DESC LIMIT ? OFFSET ?",  # noqa: S608
+            (limit, offset),
         )
         rows = await cursor.fetchall()
         return [dict(row) for row in rows]
 
-    async def count_layer(self, scope_hash: str, layer: MemoryLayer) -> int:
-        """Return the number of scoped records in one memory layer."""
+    async def count_layer(self, layer: MemoryLayer) -> int:
+        """Return the number of records in one memory layer."""
         table_by_layer = {
             MemoryLayer.CONVERSATIONAL: "am_conversation_turns",
             MemoryLayer.EPISODIC: "am_episodic_memory",
@@ -497,8 +478,7 @@ class SQLiteMemoryStore(MemoryStore):
         }
         table = table_by_layer[layer]
         cursor = await self._db.execute(
-            f"SELECT COUNT(*) FROM {table} WHERE scope_hash = ?",  # noqa: S608
-            (scope_hash,),
+            f"SELECT COUNT(*) FROM {table}",  # noqa: S608
         )
         row = await cursor.fetchone()
         return int(row[0]) if row is not None else 0
@@ -509,7 +489,6 @@ class SQLiteMemoryStore(MemoryStore):
         """Convert a SQLite row into a conversational turn record."""
         return ConversationalTurnRecord(
             id=str(row["id"]),
-            scope_hash=str(row["scope_hash"]),
             session_id=str(row["session_id"]),
             turn_index=int(row["turn_index"]),
             role=ConversationRole(str(row["role"])),
@@ -522,7 +501,6 @@ class SQLiteMemoryStore(MemoryStore):
         """Convert a SQLite row into a conversational summary."""
         return ConversationalSummary(
             summary_id=str(row["summary_id"]),
-            scope_hash=str(row["scope_hash"]),
             session_id=str(row["session_id"]),
             start_turn_index=int(row["start_turn_index"]),
             end_turn_index=int(row["end_turn_index"]),
@@ -538,7 +516,6 @@ class SQLiteMemoryStore(MemoryStore):
         embedding = json.loads(row["prompt_embedding"]) if row["prompt_embedding"] else []
         return EpisodeRecord(
             episode_id=str(row["episode_id"]),
-            scope_hash=str(row["scope_hash"]),
             prompt_text=str(row["prompt_text"]),
             prompt_embedding=embedding,
             tool_sequence=tools,
@@ -555,7 +532,6 @@ class SQLiteMemoryStore(MemoryStore):
         embedding = json.loads(row["prompt_embedding"]) if row["prompt_embedding"] else []
         return FailureEpisode(
             failure_id=str(row["failure_id"]),
-            scope_hash=str(row["scope_hash"]),
             episode_id=cast(str | None, row["episode_id"]),
             prompt_text=str(row["prompt_text"]),
             prompt_embedding=embedding,
@@ -572,7 +548,6 @@ class SQLiteMemoryStore(MemoryStore):
         embedding = json.loads(row["embedding"]) if row["embedding"] else []
         return SemanticMemoryRecord(
             fact_id=str(row["fact_id"]),
-            scope_hash=str(row["scope_hash"]),
             fact_type=SemanticFactType(str(row["fact_type"])),
             content=str(row["content"]),
             embedding=embedding,
@@ -593,7 +568,6 @@ class SQLiteMemoryStore(MemoryStore):
         triggers = json.loads(row["trigger_phrases"]) if row["trigger_phrases"] else []
         return ProceduralWorkflow(
             workflow_id=str(row["workflow_id"]),
-            scope_hash=str(row["scope_hash"]),
             workflow_signature=str(row["workflow_signature"]),
             trigger_phrases=triggers,
             tool_sequence=steps,

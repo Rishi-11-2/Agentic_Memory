@@ -19,8 +19,6 @@ import httpx
 
 from pydantic import BaseModel, Field
 
-from core.access_scope import current_scope_hash
-from core.injection_guard import InjectionGuard
 from core.models import ToolInvocation
 
 ToolCallable = Callable[[dict[str, Any]], Awaitable[str]]
@@ -49,7 +47,6 @@ class ToolRegistry:
     def __init__(self) -> None:
         """Create an empty registry for runtime tools."""
         self._tools: dict[str, tuple[ToolDefinition, ToolCallable]] = {}
-        self._injection_guard = InjectionGuard()
 
     def register(self, definition: ToolDefinition, handler: ToolCallable) -> None:
         """Register a tool definition and async handler by name."""
@@ -70,7 +67,7 @@ class ToolRegistry:
         _, handler = self._tools[invocation.tool_name]
         started = perf_counter()
         output = await handler(invocation.input_parameters)
-        invocation.output_summary = self._injection_guard.sanitise(output)
+        invocation.output_summary = output
         invocation.success = True
         invocation.latency_ms = int((perf_counter() - started) * 1000)
         return invocation
@@ -405,13 +402,11 @@ class MemorySearchTool:
         self,
         store: Any,
         embedding_model: Any,
-        scope_hash: str | None = None,
         semantic_ttl_cutoff: Any = None,
     ) -> None:
         """Create a memory search tool with injected store and embedding model."""
         self._store = store
         self._embedding_model = embedding_model
-        self._scope_hash = scope_hash
         self._semantic_ttl_cutoff = semantic_ttl_cutoff
 
     async def __call__(self, params: dict[str, Any]) -> str:
@@ -419,10 +414,6 @@ class MemorySearchTool:
         query = str(params.get("query", "")).strip()
         if not query:
             raise ValueError("memory_search requires a 'query' parameter")
-        
-        scope_hash = current_scope_hash.get() or self._scope_hash
-        if not scope_hash:
-            raise ValueError("memory_search: scope_hash is not available in the active context")
 
         top_k = _bounded_int(params.get("top_k"), 5, minimum=1, maximum=20)
         raw_layers = params.get("layers")
@@ -437,7 +428,7 @@ class MemorySearchTool:
 
         if "semantic" in selected:
             records = await self._store.search_semantic(
-                scope_hash, embedding, top_k, 0.30, 0.0,
+                embedding, top_k, 0.30, 0.0,
                 last_confirmed_after=self._semantic_ttl_cutoff,
             )
             if records:
@@ -448,7 +439,7 @@ class MemorySearchTool:
                 sections.append("\n".join(lines))
 
         if "episodic" in selected:
-            records = await self._store.search_episodes(scope_hash, embedding, top_k, 0.30)
+            records = await self._store.search_episodes(embedding, top_k, 0.30)
             if records:
                 lines = [f"  EPISODIC ({len(records)} results):"]
                 for record in records:
@@ -461,7 +452,7 @@ class MemorySearchTool:
                 sections.append("\n".join(lines))
 
         if "procedural" in selected:
-            records = await self._store.search_procedural(scope_hash, embedding, top_k, 0.30)
+            records = await self._store.search_procedural(embedding, top_k, 0.30)
             if records:
                 lines = [f"  PROCEDURAL ({len(records)} results):"]
                 for record in records:
@@ -474,7 +465,7 @@ class MemorySearchTool:
                 sections.append("\n".join(lines))
 
         if "failure" in selected:
-            records = await self._store.search_failures(scope_hash, embedding, top_k, 0.30)
+            records = await self._store.search_failures(embedding, top_k, 0.30)
             if records:
                 lines = [f"  FAILURE ({len(records)} results):"]
                 for record in records:
@@ -738,7 +729,6 @@ def default_tool_registry(
     workspace_root: str | None = None,
     memory_store: Any = None,
     embedding_model: Any = None,
-    memory_scope_hash: str | None = None,
     semantic_ttl_cutoff: Any = None,
 ) -> ToolRegistry:
     """Create the full tool registry for the Actor with all available tools."""
@@ -822,7 +812,6 @@ def default_tool_registry(
         memory_handler: ToolCallable = MemorySearchTool(
             store=memory_store,
             embedding_model=embedding_model,
-            scope_hash=memory_scope_hash,
             semantic_ttl_cutoff=semantic_ttl_cutoff,
         )
     else:

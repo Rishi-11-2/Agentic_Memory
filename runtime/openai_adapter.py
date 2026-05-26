@@ -8,7 +8,6 @@ from uuid import uuid4
 from fastapi import APIRouter, Request
 from pydantic import BaseModel, Field
 
-from core.access_scope import AccessScope
 
 router = APIRouter()
 
@@ -36,13 +35,8 @@ async def chat_completions(payload: ChatCompletionRequest, request: Request) -> 
     del payload.stream, payload.temperature, payload.max_tokens
     user_message = _last_user_message(payload.messages)
     session_id = request.headers.get("X-Session-Id", "default-session")
-    scope = AccessScope(
-        application_id=request.headers.get("X-Application-Id", "default-application"),
-        tenant_id=request.headers.get("X-Tenant-Id", "default-tenant"),
-        user_id=request.headers.get("X-User-Id", "default-user"),
-    )
     components = request.app.state.components
-    result = await components.loop.run_turn(user_message, session_id, scope)
+    result = await components.loop.run_turn(user_message, session_id)
     return {
         "id": f"chatcmpl-{uuid4()}",
         "object": "chat.completion",

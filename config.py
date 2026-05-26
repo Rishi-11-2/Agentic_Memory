@@ -27,7 +27,6 @@ class JsonFormatter(logging.Formatter):
             "phase",
             "session_id",
             "latency_ms",
-            "scope_hash",
             "attempt",
             "model",
             "input_tokens",
@@ -78,10 +77,6 @@ class Settings(BaseSettings):
     critic_self_consistency_temperature: float = Field(
         0.4, ge=0.0, le=2.0, alias="CRITIC_SELF_CONSISTENCY_TEMPERATURE"
     )
-
-    # ── Security ───────────────────────────────────────────────────
-    rate_limit_rpm: int = Field(60, ge=0, alias="RATE_LIMIT_RPM")
-    debug_key: str = Field("", alias="DEBUG_KEY")
 
     # ── Brave Search ────────────────────────────────────────────────
     brave_search_api_key: SecretStr | None = Field(default=None, alias="BRAVE_SEARCH_API_KEY")

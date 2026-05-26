@@ -9,7 +9,6 @@ import re
 from datetime import datetime, timedelta, timezone
 from typing import Protocol
 
-from core.access_scope import AccessScope
 from core.models import (
     ActorResult,
     ConversationRole,
@@ -127,17 +126,14 @@ class AgenticMemoryService:
 
     async def record_turn(
         self,
-        scope: AccessScope,
         session_id: str,
         turn_index: int,
         user_message: str,
         assistant_message: str,
     ) -> list[ConversationalTurnRecord]:
         """Append the current user and assistant messages to conversational memory."""
-        scope_hash = scope.scope_hash
         records = [
             ConversationalTurnRecord(
-                scope_hash=scope_hash,
                 session_id=session_id,
                 turn_index=turn_index,
                 role=ConversationRole.USER,
@@ -145,7 +141,6 @@ class AgenticMemoryService:
                 token_count=_estimate_tokens(user_message),
             ),
             ConversationalTurnRecord(
-                scope_hash=scope_hash,
                 session_id=session_id,
                 turn_index=turn_index,
                 role=ConversationRole.ASSISTANT,
@@ -158,34 +153,31 @@ class AgenticMemoryService:
             saved.append(await self._store.append_conversation_message(record))
         return saved
 
-    async def next_turn_index(self, scope: AccessScope, session_id: str) -> int:
+    async def next_turn_index(self, session_id: str) -> int:
         """Return the next turn index without writing memory."""
-        return await self._store.next_turn_index(scope.scope_hash, session_id)
+        return await self._store.next_turn_index(session_id)
 
     async def consolidate(
         self,
         prompt: str,
         actor_result: ActorResult,
         critic_evaluation: CriticEvaluation,
-        scope: AccessScope,
         session_id: str,
         loop_latency_ms: int,
     ) -> tuple[int, list[str], list[str]]:
         """Write lessons from one loop turn into conversational, episodic, semantic, and procedural memory."""
-        scope_hash = scope.scope_hash
-        turn_index = await self._store.next_turn_index(scope_hash, session_id)
+        turn_index = await self._store.next_turn_index(session_id)
         writes: list[str] = []
 
-        await self.record_turn(scope, session_id, turn_index, prompt, actor_result.final_response)
+        await self.record_turn(session_id, turn_index, prompt, actor_result.final_response)
         writes.append("Saved 2 conversational messages")
-        summary = await self._maybe_roll_summary(scope_hash, session_id, turn_index)
+        summary = await self._maybe_roll_summary(session_id, turn_index)
         if summary is not None:
             writes.append(f"Saved rolling summary for turns {summary.start_turn_index}-{summary.end_turn_index}")
 
         prompt_embedding = await self._embedding_model.embed(prompt)
         outcome = _episode_outcome(actor_result.tool_calls, critic_evaluation)
         episode = EpisodeRecord(
-            scope_hash=scope_hash,
             prompt_text=prompt,
             prompt_embedding=prompt_embedding,
             tool_sequence=actor_result.tool_calls,
@@ -198,38 +190,37 @@ class AgenticMemoryService:
         writes.append("Saved 1 episodic episode")
 
         saved_facts, semantic_conflicts = await self._consolidate_semantic_facts(
-            critic_evaluation, scope_hash, saved_episode.episode_id
+            critic_evaluation, saved_episode.episode_id
         )
         if saved_facts:
             writes.append(f"Saved {saved_facts} semantic fact{'s' if saved_facts != 1 else ''}")
         if semantic_conflicts:
             writes.append(f"Resolved {len(semantic_conflicts)} semantic conflict{'s' if len(semantic_conflicts) != 1 else ''}")
 
-        workflow = await self._consolidate_workflow(prompt, actor_result, critic_evaluation, scope_hash)
+        workflow = await self._consolidate_workflow(prompt, actor_result, critic_evaluation)
         if workflow is not None:
             writes.append(
                 f"Saved procedural workflow ({workflow.status.value}, success_count={workflow.success_count})"
             )
 
-        failures = await self._consolidate_failures(prompt, prompt_embedding, actor_result, scope_hash, saved_episode.episode_id)
+        failures = await self._consolidate_failures(prompt, prompt_embedding, actor_result, saved_episode.episode_id)
         if failures:
             writes.append(f"Saved {failures} failure episode{'s' if failures != 1 else ''}")
 
         return turn_index, writes, semantic_conflicts
 
     async def _maybe_roll_summary(
-        self, scope_hash: str, session_id: str, turn_index: int
+        self, session_id: str, turn_index: int
     ) -> ConversationalSummary | None:
         """Summarize and prune raw turns that fall outside the sliding window."""
         first_kept_turn = turn_index - self._memory_window_turns + 1
         if first_kept_turn <= 0:
             return None
-        old_records = await self._store.conversation_before_turn(scope_hash, session_id, first_kept_turn)
+        old_records = await self._store.conversation_before_turn(session_id, first_kept_turn)
         if not old_records:
             return None
         summary_text = await self._summary_provider.summarize(old_records)
         summary = ConversationalSummary(
-            scope_hash=scope_hash,
             session_id=session_id,
             start_turn_index=min(record.turn_index for record in old_records),
             end_turn_index=max(record.turn_index for record in old_records),
@@ -237,11 +228,11 @@ class AgenticMemoryService:
             token_count=_estimate_tokens(summary_text),
         )
         saved = await self._store.save_conversation_summary(summary)
-        await self._store.delete_conversation_before_turn(scope_hash, session_id, first_kept_turn)
+        await self._store.delete_conversation_before_turn(session_id, first_kept_turn)
         return saved
 
     async def _consolidate_semantic_facts(
-        self, critic_evaluation: CriticEvaluation, scope_hash: str, episode_id: str
+        self, critic_evaluation: CriticEvaluation, episode_id: str
     ) -> tuple[int, list[str]]:
         """Deduplicate and save Critic-proposed semantic facts."""
         saved = 0
@@ -250,7 +241,6 @@ class AgenticMemoryService:
         embeddings = await self._embedding_model.embed_batch([fact.content for fact in facts])
         for fact, embedding in zip(facts, embeddings, strict=True):
             duplicates = await self._store.search_semantic(
-                scope_hash,
                 embedding,
                 limit=1,
                 threshold=self._semantic_dedup_threshold,
@@ -262,7 +252,6 @@ class AgenticMemoryService:
                 existing = duplicates[0]
                 if _semantic_contradiction(existing.content, fact.content):
                     record = SemanticMemoryRecord(
-                        scope_hash=scope_hash,
                         fact_type=fact.fact_type,
                         content=fact.content,
                         embedding=embedding,
@@ -294,7 +283,6 @@ class AgenticMemoryService:
                 )
                 continue
             record = SemanticMemoryRecord(
-                scope_hash=scope_hash,
                 fact_type=fact.fact_type,
                 content=fact.content,
                 embedding=embedding,
@@ -317,7 +305,6 @@ class AgenticMemoryService:
         prompt: str,
         actor_result: ActorResult,
         critic_evaluation: CriticEvaluation,
-        scope_hash: str,
     ) -> ProceduralWorkflow | None:
         """Save successful non-trivial tool chains as reusable procedural memory."""
         successful_tools = [tool for tool in actor_result.tool_calls if tool.success]
@@ -334,7 +321,6 @@ class AgenticMemoryService:
         signature = _workflow_signature(successful_tools)
         workflow_text = f"{prompt} " + " ".join(step.tool_name for step in steps)
         workflow = ProceduralWorkflow(
-            scope_hash=scope_hash,
             workflow_signature=signature,
             trigger_phrases=_trigger_phrases(prompt),
             tool_sequence=steps,
@@ -350,7 +336,6 @@ class AgenticMemoryService:
         prompt: str,
         prompt_embedding: list[float],
         actor_result: ActorResult,
-        scope_hash: str,
         episode_id: str,
     ) -> int:
         """Save critic-flagged tool failures for future caution prompts."""
@@ -359,7 +344,6 @@ class AgenticMemoryService:
             if not tool.critic_flagged:
                 continue
             failure = FailureEpisode(
-                scope_hash=scope_hash,
                 episode_id=episode_id,
                 prompt_text=prompt,
                 prompt_embedding=prompt_embedding,

@@ -11,11 +11,8 @@ from typing import Any, Protocol, TypeVar, cast
 from pydantic import BaseModel
 
 from core.models import ActorLLMOutput, CriticEvaluation, LLMMessage, NewSemanticFact, SemanticFactType, ToolInvocation
-from model.circuit_breaker import SimpleCircuitBreaker
-
 ModelT = TypeVar("ModelT", bound=BaseModel)
 logger = logging.getLogger(__name__)
-_GROQ_CIRCUIT_BREAKER = SimpleCircuitBreaker()
 
 
 class StructuredLLMClient(Protocol):
@@ -55,7 +52,6 @@ class GroqStructuredClient:
         """Call Groq with exponential backoff and strict Pydantic parsing."""
         last_error: Exception | None = None
         for attempt in range(1, self._max_attempts + 1):
-            _GROQ_CIRCUIT_BREAKER.before_call()
             try:
                 response = await self._client.chat.completions.create(
                     model=model,
@@ -65,11 +61,9 @@ class GroqStructuredClient:
                 )
                 content = response.choices[0].message.content or "{}"
                 parsed = _parse_structured_json(content, response_model)
-                _GROQ_CIRCUIT_BREAKER.record_success()
                 return parsed
             except Exception as exc:
                 last_error = exc
-                _GROQ_CIRCUIT_BREAKER.record_failure()
                 logger.warning(
                     "structured_llm_retry",
                     extra={"attempt": attempt, "model": model},

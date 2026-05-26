@@ -19,41 +19,41 @@ from core.models import (
 class MemoryStore(Protocol):
     """Define explicit async persistence operations for every memory layer."""
 
-    async def next_turn_index(self, scope_hash: str, session_id: str) -> int:
-        """Return the next turn index for the scoped session."""
+    async def next_turn_index(self, session_id: str) -> int:
+        """Return the next turn index for the session."""
         ...
 
     async def append_conversation_message(self, record: ConversationalTurnRecord) -> ConversationalTurnRecord:
         """Append one user or assistant message to conversational memory."""
         ...
 
-    async def recent_conversation(self, scope_hash: str, session_id: str, limit: int) -> list[ConversationalTurnRecord]:
+    async def recent_conversation(self, session_id: str, limit: int) -> list[ConversationalTurnRecord]:
         """Return recent conversational messages for the active session."""
         ...
 
     async def get_conversation_turns(
-        self, scope_hash: str, session_id: str, limit: int
+        self, session_id: str, limit: int
     ) -> list[ConversationalTurnRecord]:
         """Return the most recent conversation messages for a session in chronological order."""
         ...
 
     async def conversation_turn(
-        self, scope_hash: str, session_id: str, turn_index: int
+        self, session_id: str, turn_index: int
     ) -> list[ConversationalTurnRecord]:
         """Return all role records for one session turn index."""
         ...
 
-    async def clear_conversation(self, scope_hash: str, session_id: str) -> int:
-        """Delete conversational messages and summaries for one scoped session only."""
+    async def clear_conversation(self, session_id: str) -> int:
+        """Delete conversational messages and summaries for one session."""
         ...
 
     async def conversation_before_turn(
-        self, scope_hash: str, session_id: str, before_turn_index: int
+        self, session_id: str, before_turn_index: int
     ) -> list[ConversationalTurnRecord]:
         """Return conversation messages old enough to be summarized and pruned."""
         ...
 
-    async def delete_conversation_before_turn(self, scope_hash: str, session_id: str, before_turn_index: int) -> int:
+    async def delete_conversation_before_turn(self, session_id: str, before_turn_index: int) -> int:
         """Delete raw conversation messages that have been safely summarized."""
         ...
 
@@ -61,7 +61,7 @@ class MemoryStore(Protocol):
         """Persist a rolling conversational summary."""
         ...
 
-    async def recent_summaries(self, scope_hash: str, session_id: str, limit: int) -> list[ConversationalSummary]:
+    async def recent_summaries(self, session_id: str, limit: int) -> list[ConversationalSummary]:
         """Return recent summaries for context assembly."""
         ...
 
@@ -70,7 +70,7 @@ class MemoryStore(Protocol):
         ...
 
     async def search_episodes(
-        self, scope_hash: str, embedding: list[float], limit: int, threshold: float
+        self, embedding: list[float], limit: int, threshold: float
     ) -> list[EpisodeRecord]:
         """Search episodic memory using cosine similarity."""
         ...
@@ -80,7 +80,7 @@ class MemoryStore(Protocol):
         ...
 
     async def search_failures(
-        self, scope_hash: str, embedding: list[float], limit: int, threshold: float
+        self, embedding: list[float], limit: int, threshold: float
     ) -> list[FailureEpisode]:
         """Search past failures using cosine similarity."""
         ...
@@ -101,7 +101,6 @@ class MemoryStore(Protocol):
 
     async def search_semantic(
         self,
-        scope_hash: str,
         embedding: list[float],
         limit: int,
         threshold: float,
@@ -112,13 +111,13 @@ class MemoryStore(Protocol):
         ...
 
     async def search_procedural(
-        self, scope_hash: str, embedding: list[float], limit: int, threshold: float
+        self, embedding: list[float], limit: int, threshold: float
     ) -> list[ProceduralWorkflow]:
         """Search procedural workflows using vector similarity."""
         ...
 
     async def match_procedural_triggers(
-        self, scope_hash: str, prompt: str, limit: int
+        self, prompt: str, limit: int
     ) -> list[ProceduralWorkflow]:
         """Find workflows whose trigger phrases appear in the current prompt."""
         ...
@@ -127,10 +126,10 @@ class MemoryStore(Protocol):
         """Insert or reinforce a procedural workflow by signature."""
         ...
 
-    async def inspect_layer(self, scope_hash: str, layer: MemoryLayer, limit: int, offset: int) -> list[dict[str, object]]:
-        """Return raw scoped records for a single memory layer."""
+    async def inspect_layer(self, layer: MemoryLayer, limit: int, offset: int) -> list[dict[str, object]]:
+        """Return raw records for a single memory layer."""
         ...
 
-    async def count_layer(self, scope_hash: str, layer: MemoryLayer) -> int:
-        """Return the number of scoped records in one memory layer."""
+    async def count_layer(self, layer: MemoryLayer) -> int:
+        """Return the number of records in one memory layer."""
         ...

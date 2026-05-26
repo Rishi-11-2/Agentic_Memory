@@ -62,13 +62,13 @@ class PostgresMemoryStore(MemoryStore):
 
     # ── Conversational ──────────────────────────────────────────────
 
-    async def next_turn_index(self, scope_hash: str, session_id: str) -> int:
-        """Return the next turn index for the scoped session."""
+    async def next_turn_index(self, session_id: str) -> int:
+        """Return the next turn index for the session."""
         async with self._pool.acquire() as conn:
             row = await conn.fetchrow(
                 "SELECT MAX(turn_index) AS max_idx FROM am_conversation_turns "
-                "WHERE scope_hash = $1 AND session_id = $2",
-                scope_hash, session_id,
+                "WHERE session_id = $1",
+                session_id,
             )
         if row is None or row["max_idx"] is None:
             return 0
@@ -78,76 +78,73 @@ class PostgresMemoryStore(MemoryStore):
         """Append one user or assistant message to conversational memory."""
         async with self._pool.acquire() as conn:
             await conn.execute(
-                "INSERT INTO am_conversation_turns (id, scope_hash, session_id, turn_index, role, content, token_count, timestamp) "
-                "VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
-                record.id, record.scope_hash, record.session_id, record.turn_index,
+                "INSERT INTO am_conversation_turns (id, session_id, turn_index, role, content, token_count, timestamp) "
+                "VALUES ($1, $2, $3, $4, $5, $6, $7)",
+                record.id, record.session_id, record.turn_index,
                 record.role.value, record.content, record.token_count, record.timestamp,
             )
         return record
 
-    async def recent_conversation(self, scope_hash: str, session_id: str, limit: int) -> list[ConversationalTurnRecord]:
+    async def recent_conversation(self, session_id: str, limit: int) -> list[ConversationalTurnRecord]:
         """Return recent conversational messages for the active session."""
         async with self._pool.acquire() as conn:
             rows = await conn.fetch(
-                "SELECT * FROM am_conversation_turns WHERE scope_hash = $1 AND session_id = $2 "
-                "ORDER BY turn_index DESC, timestamp DESC LIMIT $3",
-                scope_hash, session_id, limit,
+                "SELECT * FROM am_conversation_turns WHERE session_id = $1 "
+                "ORDER BY turn_index DESC, timestamp DESC LIMIT $2",
+                session_id, limit,
             )
         return list(reversed([self._conv_from_row(row) for row in rows]))
 
     async def get_conversation_turns(
-        self, scope_hash: str, session_id: str, limit: int
+        self, session_id: str, limit: int
     ) -> list[ConversationalTurnRecord]:
         """Return recent conversational messages in chronological order."""
-        return await self.recent_conversation(scope_hash, session_id, limit)
+        return await self.recent_conversation(session_id, limit)
 
     async def conversation_turn(
-        self, scope_hash: str, session_id: str, turn_index: int
+        self, session_id: str, turn_index: int
     ) -> list[ConversationalTurnRecord]:
         """Return all role records for one session turn index."""
         async with self._pool.acquire() as conn:
             rows = await conn.fetch(
-                "SELECT * FROM am_conversation_turns WHERE scope_hash = $1 AND session_id = $2 AND turn_index = $3 "
+                "SELECT * FROM am_conversation_turns WHERE session_id = $1 AND turn_index = $2 "
                 "ORDER BY timestamp",
-                scope_hash,
                 session_id,
                 turn_index,
             )
         return [self._conv_from_row(row) for row in rows]
 
-    async def clear_conversation(self, scope_hash: str, session_id: str) -> int:
-        """Delete raw conversation and summaries for one scoped session."""
+    async def clear_conversation(self, session_id: str) -> int:
+        """Delete raw conversation and summaries for one session."""
         async with self._pool.acquire() as conn:
             turns = await conn.execute(
-                "DELETE FROM am_conversation_turns WHERE scope_hash = $1 AND session_id = $2",
-                scope_hash,
+                "DELETE FROM am_conversation_turns WHERE session_id = $1",
                 session_id,
             )
             summaries = await conn.execute(
-                "DELETE FROM am_conversation_summaries WHERE scope_hash = $1 AND session_id = $2",
-                scope_hash,
+                "DELETE FROM am_conversation_summaries WHERE session_id = $1",
                 session_id,
             )
         return _row_count(turns) + _row_count(summaries)
 
     async def conversation_before_turn(
-        self, scope_hash: str, session_id: str, before_turn_index: int
+        self, session_id: str, before_turn_index: int
     ) -> list[ConversationalTurnRecord]:
         """Return conversation messages old enough to be summarized and pruned."""
         async with self._pool.acquire() as conn:
             rows = await conn.fetch(
-                "SELECT * FROM am_conversation_turns WHERE scope_hash = $1 AND session_id = $2 AND turn_index < $3 "
+                "SELECT * FROM am_conversation_turns WHERE session_id = $1 AND turn_index < $2 "
                 "ORDER BY turn_index, timestamp",
-                scope_hash, session_id, before_turn_index,
+                session_id, before_turn_index,
             )
         return [self._conv_from_row(row) for row in rows]
 
-    async def delete_conversation_before_turn(self, scope_hash: str, session_id: str, before_turn_index: int) -> int:
+    async def delete_conversation_before_turn(self, session_id: str, before_turn_index: int) -> int:
         """Delete raw conversation messages that have been safely summarized."""
         async with self._pool.acquire() as conn:
             result = await conn.execute(
-                "DELETE FROM am_conversation_turns WHERE scope_hash = $1 AND session_id = $2 AND turn_index < $3",
-                scope_hash, session_id, before_turn_index,
+                "DELETE FROM am_conversation_turns WHERE session_id = $1 AND turn_index < $2",
+                session_id, before_turn_index,
             )
         return int(result.split()[-1]) if result else 0
 
@@ -155,21 +152,21 @@ class PostgresMemoryStore(MemoryStore):
         """Persist a rolling conversational summary."""
         async with self._pool.acquire() as conn:
             await conn.execute(
-                "INSERT INTO am_conversation_summaries (summary_id, scope_hash, session_id, start_turn_index, end_turn_index, summary, token_count, created_at) "
-                "VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
-                summary.summary_id, summary.scope_hash, summary.session_id,
+                "INSERT INTO am_conversation_summaries (summary_id, session_id, start_turn_index, end_turn_index, summary, token_count, created_at) "
+                "VALUES ($1, $2, $3, $4, $5, $6, $7)",
+                summary.summary_id, summary.session_id,
                 summary.start_turn_index, summary.end_turn_index,
                 summary.summary, summary.token_count, summary.created_at,
             )
         return summary
 
-    async def recent_summaries(self, scope_hash: str, session_id: str, limit: int) -> list[ConversationalSummary]:
+    async def recent_summaries(self, session_id: str, limit: int) -> list[ConversationalSummary]:
         """Return recent summaries for context assembly."""
         async with self._pool.acquire() as conn:
             rows = await conn.fetch(
-                "SELECT * FROM am_conversation_summaries WHERE scope_hash = $1 AND session_id = $2 "
-                "ORDER BY created_at DESC LIMIT $3",
-                scope_hash, session_id, limit,
+                "SELECT * FROM am_conversation_summaries WHERE session_id = $1 "
+                "ORDER BY created_at DESC LIMIT $2",
+                session_id, limit,
             )
         return [self._summary_from_row(row) for row in rows]
 
@@ -183,10 +180,10 @@ class PostgresMemoryStore(MemoryStore):
 
         async with self._pool.acquire() as conn:
             await conn.execute(
-                f"INSERT INTO am_episodic_memory (episode_id, scope_hash, prompt_text, {vec_col}, tool_sequence, "
+                f"INSERT INTO am_episodic_memory (episode_id, prompt_text, {vec_col}, tool_sequence, "
                 "final_response, outcome, error_trace, latency_ms, timestamp) "
-                f"VALUES ($1, $2, $3, $4::vector, $5::jsonb, $6, $7, $8, $9, $10)",
-                episode.episode_id, episode.scope_hash, episode.prompt_text,
+                f"VALUES ($1, $2, $3::vector, $4::jsonb, $5, $6, $7, $8, $9)",
+                episode.episode_id, episode.prompt_text,
                 _vec_literal(vec_val), tool_seq,
                 episode.final_response, episode.outcome.value, episode.error_trace,
                 episode.latency_ms, episode.timestamp,
@@ -194,23 +191,23 @@ class PostgresMemoryStore(MemoryStore):
         return episode
 
     async def search_episodes(
-        self, scope_hash: str, embedding: list[float], limit: int, threshold: float
+        self, embedding: list[float], limit: int, threshold: float
     ) -> list[EpisodeRecord]:
         """Search episodic memory using server-side pgvector cosine similarity."""
         if len(embedding) == 384:
             async with self._pool.acquire() as conn:
                 rows = await conn.fetch(
                     "SELECT *, 1 - (prompt_embedding <=> $1::vector) AS similarity "
-                    "FROM am_episodic_memory WHERE scope_hash = $2 AND prompt_embedding IS NOT NULL "
-                    "AND 1 - (prompt_embedding <=> $1::vector) >= $3 "
-                    "ORDER BY prompt_embedding <=> $1::vector LIMIT $4",
-                    _vec_literal(embedding), scope_hash, threshold, limit,
+                    "FROM am_episodic_memory WHERE prompt_embedding IS NOT NULL "
+                    "AND 1 - (prompt_embedding <=> $1::vector) >= $2 "
+                    "ORDER BY prompt_embedding <=> $1::vector LIMIT $3",
+                    _vec_literal(embedding), threshold, limit,
                 )
             return [self._episode_from_row(row) for row in rows]
         # Fallback: hash embeddings use client-side ranking
         async with self._pool.acquire() as conn:
             rows = await conn.fetch(
-                "SELECT * FROM am_episodic_memory WHERE scope_hash = $1 LIMIT 200", scope_hash
+                "SELECT * FROM am_episodic_memory LIMIT 200"
             )
         return self._rank_episodes(rows, embedding, threshold, limit)
 
@@ -224,32 +221,32 @@ class PostgresMemoryStore(MemoryStore):
 
         async with self._pool.acquire() as conn:
             await conn.execute(
-                f"INSERT INTO am_failure_episodes (failure_id, scope_hash, episode_id, prompt_text, {vec_col}, "
+                f"INSERT INTO am_failure_episodes (failure_id, episode_id, prompt_text, {vec_col}, "
                 "tool_name, tool_input, exception_message, error_trace, timestamp) "
-                f"VALUES ($1, $2, $3, $4, $5::vector, $6, $7::jsonb, $8, $9, $10)",
-                failure.failure_id, failure.scope_hash, failure.episode_id, failure.prompt_text,
+                f"VALUES ($1, $2, $3, $4::vector, $5, $6::jsonb, $7, $8, $9)",
+                failure.failure_id, failure.episode_id, failure.prompt_text,
                 _vec_literal(vec_val), failure.tool_name, tool_input,
                 failure.exception_message, failure.error_trace, failure.timestamp,
             )
         return failure
 
     async def search_failures(
-        self, scope_hash: str, embedding: list[float], limit: int, threshold: float
+        self, embedding: list[float], limit: int, threshold: float
     ) -> list[FailureEpisode]:
         """Search past failures using server-side pgvector cosine similarity."""
         if len(embedding) == 384:
             async with self._pool.acquire() as conn:
                 rows = await conn.fetch(
                     "SELECT *, 1 - (prompt_embedding <=> $1::vector) AS similarity "
-                    "FROM am_failure_episodes WHERE scope_hash = $2 AND prompt_embedding IS NOT NULL "
-                    "AND 1 - (prompt_embedding <=> $1::vector) >= $3 "
-                    "ORDER BY prompt_embedding <=> $1::vector LIMIT $4",
-                    _vec_literal(embedding), scope_hash, threshold, limit,
+                    "FROM am_failure_episodes WHERE prompt_embedding IS NOT NULL "
+                    "AND 1 - (prompt_embedding <=> $1::vector) >= $2 "
+                    "ORDER BY prompt_embedding <=> $1::vector LIMIT $3",
+                    _vec_literal(embedding), threshold, limit,
                 )
             return [self._failure_from_row(row) for row in rows]
         async with self._pool.acquire() as conn:
             rows = await conn.fetch(
-                "SELECT * FROM am_failure_episodes WHERE scope_hash = $1 LIMIT 200", scope_hash
+                "SELECT * FROM am_failure_episodes LIMIT 200"
             )
         return self._rank_failures(rows, embedding, threshold, limit)
 
@@ -262,10 +259,10 @@ class PostgresMemoryStore(MemoryStore):
 
         async with self._pool.acquire() as conn:
             await conn.execute(
-                f"INSERT INTO am_semantic_memory (fact_id, scope_hash, fact_type, content, {vec_col}, "
+                f"INSERT INTO am_semantic_memory (fact_id, fact_type, content, {vec_col}, "
                 "confidence_score, source, source_episode_id, created_at, last_reinforced_at, last_confirmed_at) "
-                f"VALUES ($1, $2, $3, $4, $5::vector, $6, $7, $8, $9, $10, $11)",
-                record.fact_id, record.scope_hash, record.fact_type.value, record.content,
+                f"VALUES ($1, $2, $3, $4::vector, $5, $6, $7, $8, $9, $10)",
+                record.fact_id, record.fact_type.value, record.content,
                 _vec_literal(vec_val), record.confidence_score, record.source, record.source_episode_id,
                 record.created_at, record.last_reinforced_at, record.last_confirmed_at,
             )
@@ -314,7 +311,6 @@ class PostgresMemoryStore(MemoryStore):
 
     async def search_semantic(
         self,
-        scope_hash: str,
         embedding: list[float],
         limit: int,
         threshold: float,
@@ -326,52 +322,51 @@ class PostgresMemoryStore(MemoryStore):
             async with self._pool.acquire() as conn:
                 rows = await conn.fetch(
                     "SELECT *, 1 - (embedding <=> $1::vector) AS similarity "
-                    "FROM am_semantic_memory WHERE scope_hash = $2 AND embedding IS NOT NULL "
-                    "AND confidence_score >= $5 "
-                    "AND ($6::timestamptz IS NULL OR last_confirmed_at >= $6::timestamptz) "
-                    "AND 1 - (embedding <=> $1::vector) >= $3 "
-                    "ORDER BY embedding <=> $1::vector LIMIT $4",
-                    _vec_literal(embedding), scope_hash, threshold, limit, min_confidence, last_confirmed_after,
+                    "FROM am_semantic_memory WHERE embedding IS NOT NULL "
+                    "AND confidence_score >= $4 "
+                    "AND ($5::timestamptz IS NULL OR last_confirmed_at >= $5::timestamptz) "
+                    "AND 1 - (embedding <=> $1::vector) >= $2 "
+                    "ORDER BY embedding <=> $1::vector LIMIT $3",
+                    _vec_literal(embedding), threshold, limit, min_confidence, last_confirmed_after,
                 )
             return [self._semantic_from_row(row) for row in rows]
         async with self._pool.acquire() as conn:
             rows = await conn.fetch(
-                "SELECT * FROM am_semantic_memory WHERE scope_hash = $1 AND confidence_score >= $2 "
-                "AND ($3::timestamptz IS NULL OR last_confirmed_at >= $3::timestamptz) LIMIT 200",
-                scope_hash, min_confidence, last_confirmed_after,
+                "SELECT * FROM am_semantic_memory WHERE confidence_score >= $1 "
+                "AND ($2::timestamptz IS NULL OR last_confirmed_at >= $2::timestamptz) LIMIT 200",
+                min_confidence, last_confirmed_after,
             )
         return self._rank_semantic(rows, embedding, threshold, limit)
 
     # ── Procedural ──────────────────────────────────────────────────
 
     async def search_procedural(
-        self, scope_hash: str, embedding: list[float], limit: int, threshold: float
+        self, embedding: list[float], limit: int, threshold: float
     ) -> list[ProceduralWorkflow]:
         """Search procedural workflows using server-side pgvector similarity."""
         if len(embedding) == 384:
             async with self._pool.acquire() as conn:
                 rows = await conn.fetch(
                     "SELECT *, 1 - (embedding <=> $1::vector) AS similarity "
-                    "FROM am_procedural_workflows WHERE scope_hash = $2 AND embedding IS NOT NULL "
-                    "AND 1 - (embedding <=> $1::vector) >= $3 "
-                    "ORDER BY embedding <=> $1::vector LIMIT $4",
-                    _vec_literal(embedding), scope_hash, threshold, limit,
+                    "FROM am_procedural_workflows WHERE embedding IS NOT NULL "
+                    "AND 1 - (embedding <=> $1::vector) >= $2 "
+                    "ORDER BY embedding <=> $1::vector LIMIT $3",
+                    _vec_literal(embedding), threshold, limit,
                 )
             return [self._workflow_from_row(row) for row in rows]
         async with self._pool.acquire() as conn:
             rows = await conn.fetch(
-                "SELECT * FROM am_procedural_workflows WHERE scope_hash = $1 LIMIT 200", scope_hash
+                "SELECT * FROM am_procedural_workflows LIMIT 200"
             )
         return self._rank_workflows(rows, embedding, threshold, limit)
 
     async def match_procedural_triggers(
-        self, scope_hash: str, prompt: str, limit: int
+        self, prompt: str, limit: int
     ) -> list[ProceduralWorkflow]:
         """Find workflows whose trigger phrases appear in the current prompt."""
         async with self._pool.acquire() as conn:
             rows = await conn.fetch(
-                "SELECT * FROM am_procedural_workflows WHERE scope_hash = $1 ORDER BY success_count DESC LIMIT 100",
-                scope_hash,
+                "SELECT * FROM am_procedural_workflows ORDER BY success_count DESC LIMIT 100",
             )
         prompt_normalized = prompt.lower()
         matches: list[ProceduralWorkflow] = []
@@ -387,8 +382,8 @@ class PostgresMemoryStore(MemoryStore):
         """Insert or reinforce a procedural workflow by signature."""
         async with self._pool.acquire() as conn:
             existing = await conn.fetchrow(
-                "SELECT * FROM am_procedural_workflows WHERE scope_hash = $1 AND workflow_signature = $2",
-                workflow.scope_hash, workflow.workflow_signature,
+                "SELECT * FROM am_procedural_workflows WHERE workflow_signature = $1",
+                workflow.workflow_signature,
             )
         if existing:
             current = self._workflow_from_row(existing)
@@ -415,18 +410,18 @@ class PostgresMemoryStore(MemoryStore):
 
         async with self._pool.acquire() as conn:
             await conn.execute(
-                f"INSERT INTO am_procedural_workflows (workflow_id, scope_hash, workflow_signature, trigger_phrases, "
+                f"INSERT INTO am_procedural_workflows (workflow_id, workflow_signature, trigger_phrases, "
                 f"tool_sequence, success_count, status, avg_latency_ms, {vec_col}, created_at, updated_at) "
-                f"VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7, $8, $9::vector, $10, $11)",
-                workflow.workflow_id, workflow.scope_hash, workflow.workflow_signature,
+                f"VALUES ($1, $2, $3, $4::jsonb, $5, $6, $7, $8::vector, $9, $10)",
+                workflow.workflow_id, workflow.workflow_signature,
                 workflow.trigger_phrases, tool_seq,
                 workflow.success_count, workflow.status.value, workflow.avg_latency_ms,
                 _vec_literal(vec_val), workflow.created_at, workflow.updated_at,
             )
         return workflow
 
-    async def inspect_layer(self, scope_hash: str, layer: MemoryLayer, limit: int, offset: int) -> list[dict[str, object]]:
-        """Return raw scoped records for a single memory layer."""
+    async def inspect_layer(self, layer: MemoryLayer, limit: int, offset: int) -> list[dict[str, object]]:
+        """Return raw records for a single memory layer."""
         table_by_layer = {
             MemoryLayer.CONVERSATIONAL: "am_conversation_turns",
             MemoryLayer.EPISODIC: "am_episodic_memory",
@@ -445,13 +440,13 @@ class PostgresMemoryStore(MemoryStore):
         order_column = order_by_layer[layer]
         async with self._pool.acquire() as conn:
             rows = await conn.fetch(
-                f"SELECT * FROM {table} WHERE scope_hash = $1 ORDER BY {order_column} DESC LIMIT $2 OFFSET $3",  # noqa: S608
-                scope_hash, limit, offset,
+                f"SELECT * FROM {table} ORDER BY {order_column} DESC LIMIT $1 OFFSET $2",  # noqa: S608
+                limit, offset,
             )
         return [dict(row) for row in rows]
 
-    async def count_layer(self, scope_hash: str, layer: MemoryLayer) -> int:
-        """Return the number of scoped records in one memory layer."""
+    async def count_layer(self, layer: MemoryLayer) -> int:
+        """Return the number of records in one memory layer."""
         table_by_layer = {
             MemoryLayer.CONVERSATIONAL: "am_conversation_turns",
             MemoryLayer.EPISODIC: "am_episodic_memory",
@@ -462,8 +457,7 @@ class PostgresMemoryStore(MemoryStore):
         table = table_by_layer[layer]
         async with self._pool.acquire() as conn:
             value = await conn.fetchval(
-                f"SELECT COUNT(*) FROM {table} WHERE scope_hash = $1",  # noqa: S608
-                scope_hash,
+                f"SELECT COUNT(*) FROM {table}",  # noqa: S608
             )
         return int(value or 0)
 
@@ -473,7 +467,6 @@ class PostgresMemoryStore(MemoryStore):
         """Convert a PostgreSQL row into a conversational turn record."""
         return ConversationalTurnRecord(
             id=str(row["id"]),
-            scope_hash=str(row["scope_hash"]),
             session_id=str(row["session_id"]),
             turn_index=int(row["turn_index"]),
             role=ConversationRole(str(row["role"])),
@@ -486,7 +479,6 @@ class PostgresMemoryStore(MemoryStore):
         """Convert a PostgreSQL row into a conversational summary."""
         return ConversationalSummary(
             summary_id=str(row["summary_id"]),
-            scope_hash=str(row["scope_hash"]),
             session_id=str(row["session_id"]),
             start_turn_index=int(row["start_turn_index"]),
             end_turn_index=int(row["end_turn_index"]),
@@ -504,7 +496,6 @@ class PostgresMemoryStore(MemoryStore):
         embedding = _parse_pg_vector(row.get("prompt_embedding") or row.get("prompt_embedding_hash"))
         return EpisodeRecord(
             episode_id=str(row["episode_id"]),
-            scope_hash=str(row["scope_hash"]),
             prompt_text=str(row["prompt_text"]),
             prompt_embedding=embedding,
             tool_sequence=tools,
@@ -524,7 +515,6 @@ class PostgresMemoryStore(MemoryStore):
             tool_input = json.loads(tool_input)
         return FailureEpisode(
             failure_id=str(row["failure_id"]),
-            scope_hash=str(row["scope_hash"]),
             episode_id=cast(str | None, row.get("episode_id")),
             prompt_text=str(row["prompt_text"]),
             prompt_embedding=embedding,
@@ -541,7 +531,6 @@ class PostgresMemoryStore(MemoryStore):
         embedding = _parse_pg_vector(row.get("embedding") or row.get("hash_embedding"))
         return SemanticMemoryRecord(
             fact_id=str(row["fact_id"]),
-            scope_hash=str(row["scope_hash"]),
             fact_type=SemanticFactType(str(row["fact_type"])),
             content=str(row["content"]),
             embedding=embedding,
@@ -563,7 +552,6 @@ class PostgresMemoryStore(MemoryStore):
         embedding = _parse_pg_vector(row.get("embedding") or row.get("hash_embedding"))
         return ProceduralWorkflow(
             workflow_id=str(row["workflow_id"]),
-            scope_hash=str(row["scope_hash"]),
             workflow_signature=str(row["workflow_signature"]),
             trigger_phrases=list(row.get("trigger_phrases") or []),
             tool_sequence=steps,

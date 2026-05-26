@@ -11,11 +11,8 @@ from typing import Any, TypeVar, cast
 from pydantic import BaseModel
 
 from core.models import LLMMessage
-from model.circuit_breaker import SimpleCircuitBreaker
-
 ModelT = TypeVar("ModelT", bound=BaseModel)
 logger = logging.getLogger(__name__)
-_ANTHROPIC_CIRCUIT_BREAKER = SimpleCircuitBreaker()
 
 
 class AnthropicStructuredClient:
@@ -56,7 +53,6 @@ class AnthropicStructuredClient:
         ]
         last_error: Exception | None = None
         for attempt in range(1, self._max_attempts + 1):
-            _ANTHROPIC_CIRCUIT_BREAKER.before_call()
             try:
                 response = await self._client.messages.create(
                     model=model,
@@ -75,16 +71,13 @@ class AnthropicStructuredClient:
                     },
                 )
                 parsed = _parse_structured_json(text, response_model)
-                _ANTHROPIC_CIRCUIT_BREAKER.record_success()
                 return parsed
             except RateLimitError as exc:
                 last_error = exc
-                _ANTHROPIC_CIRCUIT_BREAKER.record_failure()
                 logger.warning("anthropic_rate_limit_retry", extra={"attempt": attempt, "model": model}, exc_info=exc)
                 if attempt < self._max_attempts:
                     await asyncio.sleep(2.0)
             except Exception as exc:
-                _ANTHROPIC_CIRCUIT_BREAKER.record_failure()
                 raise RuntimeError("Anthropic structured completion failed") from exc
         raise RuntimeError(f"Anthropic structured completion failed after {self._max_attempts} attempts") from last_error
 

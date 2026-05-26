@@ -5,7 +5,6 @@ from __future__ import annotations
 import re
 from datetime import datetime, timedelta, timezone
 
-from core.access_scope import AccessScope
 from core.models import (
     EpisodeRecord,
     FailureEpisode,
@@ -64,7 +63,7 @@ class HeuristicRetrievalPlanner:
         self._semantic_memory_ttl_days = semantic_memory_ttl_days
         self._session_weights: dict[str, dict[str, float]] = {}
 
-    async def plan(self, prompt: str, scope: AccessScope, session_id: str) -> RetrievalPlan:
+    async def plan(self, prompt: str, session_id: str) -> RetrievalPlan:
         """Build a retrieval plan and populate it with raw retrieved records."""
         normalized = _normalize(prompt)
         tokens = _tokens(prompt)
@@ -82,19 +81,17 @@ class HeuristicRetrievalPlanner:
         )
 
         embedding = await self._embedding_model.embed(prompt)
-        scope_hash = scope.scope_hash
 
-        conversational = await self._store.recent_conversation(scope_hash, session_id, self._memory_window_turns * 2)
-        summaries = await self._store.recent_summaries(scope_hash, session_id, 2)
+        conversational = await self._store.recent_conversation(session_id, self._memory_window_turns * 2)
+        summaries = await self._store.recent_summaries(session_id, 2)
 
-        trigger_workflows = await self._store.match_procedural_triggers(scope_hash, prompt, 3)
+        trigger_workflows = await self._store.match_procedural_triggers(prompt, 3)
         if trigger_workflows:
             query_procedural = True
 
         semantic_records = []
         if query_semantic:
             semantic_records = await self._store.search_semantic(
-                scope_hash,
                 embedding,
                 5,
                 0.35,
@@ -104,14 +101,14 @@ class HeuristicRetrievalPlanner:
 
         procedural_workflows = trigger_workflows
         if query_procedural:
-            vector_workflows = await self._store.search_procedural(scope_hash, embedding, 3, 0.40)
+            vector_workflows = await self._store.search_procedural(embedding, 3, 0.40)
             procedural_workflows = _dedupe_workflows(trigger_workflows + vector_workflows)
 
         base_episode_threshold = 0.45 if _contains_any(normalized, self._history_keywords) else 0.55
         episode_threshold = max(0.25, min(0.85, base_episode_threshold / weights["episodic"]))
-        episodic_records = await self._store.search_episodes(scope_hash, embedding, 3, episode_threshold)
+        episodic_records = await self._store.search_episodes(embedding, 3, episode_threshold)
         failure_matches = await self._store.search_failures(
-            scope_hash, embedding, 3, self._failure_similarity_threshold
+            embedding, 3, self._failure_similarity_threshold
         )
         query_episodic = bool(episodic_records or failure_matches)
 
@@ -130,7 +127,6 @@ class HeuristicRetrievalPlanner:
         )
 
         return RetrievalPlan(
-            scope_hash=scope_hash,
             session_id=session_id,
             prompt=prompt,
             query_conversational=True,

@@ -70,7 +70,6 @@ class ConversationalTurnRecord(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
     id: str = Field(default_factory=lambda: str(uuid4()))
-    scope_hash: str
     session_id: str
     turn_index: int = Field(ge=0)
     role: ConversationRole
@@ -83,7 +82,6 @@ class ConversationalSummary(BaseModel):
     """Store a compressed summary of conversation turns pruned from the window."""
 
     summary_id: str = Field(default_factory=lambda: str(uuid4()))
-    scope_hash: str
     session_id: str
     start_turn_index: int = Field(ge=0)
     end_turn_index: int = Field(ge=0)
@@ -115,7 +113,6 @@ class EpisodeRecord(BaseModel):
     """Persist an append-only record of a complete actor turn."""
 
     episode_id: str = Field(default_factory=lambda: str(uuid4()))
-    scope_hash: str
     prompt_text: str
     prompt_embedding: list[float] = Field(default_factory=list)
     tool_sequence: list[ToolInvocation] = Field(default_factory=list)
@@ -136,7 +133,6 @@ class FailureEpisode(BaseModel):
     """Persist detailed tool failure context for future avoidance."""
 
     failure_id: str = Field(default_factory=lambda: str(uuid4()))
-    scope_hash: str
     episode_id: str | None = None
     prompt_text: str
     prompt_embedding: list[float] = Field(default_factory=list)
@@ -165,7 +161,6 @@ class SemanticMemoryRecord(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
     fact_id: str = Field(default_factory=lambda: str(uuid4()))
-    scope_hash: str
     fact_type: SemanticFactType
     content: str
     embedding: list[float] = Field(default_factory=list)
@@ -190,7 +185,6 @@ class ProceduralWorkflow(BaseModel):
     """Store an ordered reusable tool workflow learned from successful episodes."""
 
     workflow_id: str = Field(default_factory=lambda: str(uuid4()))
-    scope_hash: str
     workflow_signature: str
     trigger_phrases: list[str] = Field(default_factory=list)
     tool_sequence: list[ProceduralToolStep] = Field(default_factory=list)
@@ -220,7 +214,6 @@ class RetrievedRecord(BaseModel):
 class RetrievalPlan(BaseModel):
     """Capture layer flags, rationales, and raw records selected by the planner."""
 
-    scope_hash: str
     session_id: str
     prompt: str
     query_conversational: bool = True
@@ -327,20 +320,16 @@ class LoopResult(BaseModel):
 
 
 class ChatRequest(BaseModel):
-    """Validate the public FastAPI chat request for scoped memory access."""
+    """Validate the public FastAPI chat request."""
 
     user_message: str
     session_id: str
-    application_id: str
-    tenant_id: str
-    user_id: str
 
 
 class MemoryInspectResponse(BaseModel):
     """Return paginated raw memory records for admin/debug inspection."""
 
     layer: MemoryLayer
-    scope_hash: str
     limit: int
     offset: int
     records: list[JsonDict]
