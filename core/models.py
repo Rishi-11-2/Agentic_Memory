@@ -319,13 +319,6 @@ class LoopResult(BaseModel):
     semantic_conflicts: list[str] = Field(default_factory=list)
 
 
-class ChatRequest(BaseModel):
-    """Validate the public FastAPI chat request."""
-
-    user_message: str
-    session_id: str
-
-
 class MemoryInspectResponse(BaseModel):
     """Return paginated raw memory records for admin/debug inspection."""
 
