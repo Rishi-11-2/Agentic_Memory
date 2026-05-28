@@ -5,6 +5,15 @@ from __future__ import annotations
 from config import Settings
 from model.groq_client import DeterministicStructuredClient, GroqStructuredClient, StructuredLLMClient
 
+__all__ = [
+    "DeterministicStructuredClient",
+    "GroqStructuredClient",
+    "StructuredLLMClient",
+    "create_llm_client",
+    "actor_model_name",
+    "critic_model_name",
+]
+
 
 def create_llm_client(settings: Settings) -> StructuredLLMClient:
     """Create the configured structured LLM client."""

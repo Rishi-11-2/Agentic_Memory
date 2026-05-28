@@ -6,7 +6,7 @@ import traceback
 from time import perf_counter
 
 from core.models import ActorLLMOutput, ActorResult, LLMMessage, MemoryContext, ToolInvocation
-from model.groq_client import StructuredLLMClient
+from model import StructuredLLMClient
 from runtime.tools import ToolDefinition, ToolRegistry
 
 

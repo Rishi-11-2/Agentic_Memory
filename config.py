@@ -71,6 +71,9 @@ class Settings(BaseSettings):
     mcp_transport: str = Field("stdio", alias="MCP_TRANSPORT")
     mcp_http_port: int = Field(8001, ge=1, le=65535, alias="MCP_HTTP_PORT")
 
+    # ── Standalone Loop ────────────────────────────────────────────
+    standalone_loop_enabled: bool = Field(False, alias="STANDALONE_LOOP_ENABLED")
+
     # ── Reliability ────────────────────────────────────────────────
     critic_timeout_seconds: float = Field(8.0, gt=0.0, alias="CRITIC_TIMEOUT_SECONDS")
     critic_self_consistency_samples: int = Field(3, ge=1, le=9, alias="CRITIC_SELF_CONSISTENCY_SAMPLES")
@@ -189,6 +192,12 @@ class Settings(BaseSettings):
             raise ValueError("ANTHROPIC_API_KEY is required when LLM_PROVIDER=anthropic")
         if self.llm_provider == "openai" and not self.openai_api_key:
             raise ValueError("OPENAI_API_KEY is required when LLM_PROVIDER=openai")
+
+        if self.standalone_loop_enabled and self.llm_provider == "deterministic":
+            raise ValueError(
+                "STANDALONE_LOOP_ENABLED=true requires a real LLM provider "
+                "(groq, anthropic, or openai), not 'deterministic'"
+            )
 
         return self
 

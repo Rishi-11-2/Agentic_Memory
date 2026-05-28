@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from core.models import ActorResult, CriticEvaluation, LLMMessage, MemoryContext
-from model.groq_client import StructuredLLMClient
+from model import StructuredLLMClient
 
 
 class Critic:
