@@ -56,6 +56,7 @@ CREATE TABLE IF NOT EXISTS am_conversation_summaries (
 CREATE TABLE IF NOT EXISTS am_episodic_memory (
     episode_id TEXT PRIMARY KEY,
     prompt_text TEXT NOT NULL,
+    reasoning_summary TEXT NOT NULL DEFAULT '',
     prompt_embedding TEXT,
     tool_sequence TEXT NOT NULL DEFAULT '[]',
     final_response TEXT NOT NULL DEFAULT '',
@@ -246,9 +247,11 @@ class SQLiteMemoryStore(MemoryStore):
     async def save_episode(self, episode: EpisodeRecord) -> EpisodeRecord:
         """Persist an append-only episodic memory record."""
         await self._db.execute(
-            "INSERT INTO am_episodic_memory (episode_id, prompt_text, prompt_embedding, tool_sequence, "
-            "final_response, outcome, error_trace, latency_ms, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO am_episodic_memory (episode_id, prompt_text, reasoning_summary, prompt_embedding, "
+            "tool_sequence, final_response, outcome, error_trace, latency_ms, timestamp) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (episode.episode_id, episode.prompt_text,
+             episode.reasoning_summary,
              json.dumps(episode.prompt_embedding) if episode.prompt_embedding else None,
              json.dumps([tool.model_dump(mode="json") for tool in episode.tool_sequence]),
              episode.final_response, episode.outcome.value, episode.error_trace,
@@ -517,6 +520,7 @@ class SQLiteMemoryStore(MemoryStore):
         return EpisodeRecord(
             episode_id=str(row["episode_id"]),
             prompt_text=str(row["prompt_text"]),
+            reasoning_summary=str(row["reasoning_summary"] or ""),
             prompt_embedding=embedding,
             tool_sequence=tools,
             final_response=str(row["final_response"] or ""),
@@ -585,6 +589,13 @@ class SQLiteMemoryStore(MemoryStore):
 
 async def _migrate_schema(db: aiosqlite.Connection) -> None:
     """Apply additive SQLite migrations for databases created by older releases."""
+    cursor = await db.execute("PRAGMA table_info(am_episodic_memory)")
+    episode_columns = {str(row["name"]) for row in await cursor.fetchall()}
+    if "reasoning_summary" not in episode_columns:
+        await db.execute(
+            "ALTER TABLE am_episodic_memory ADD COLUMN reasoning_summary TEXT NOT NULL DEFAULT ''"
+        )
+
     cursor = await db.execute("PRAGMA table_info(am_semantic_memory)")
     columns = {str(row["name"]) for row in await cursor.fetchall()}
     if "source" not in columns:

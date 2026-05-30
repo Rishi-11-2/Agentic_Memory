@@ -20,16 +20,12 @@ class AnthropicStructuredClient:
 
     def __init__(
         self,
-        actor_model: str = "claude-sonnet-4-5",
-        critic_model: str = "claude-opus-4-5",
         api_key: str | None = None,
         max_attempts: int = 3,
     ) -> None:
         """Create an Anthropic async client using ANTHROPIC_API_KEY from the environment."""
         from anthropic import AsyncAnthropic
 
-        self.actor_model = actor_model
-        self.critic_model = critic_model
         self._client = AsyncAnthropic(
             api_key=api_key,
         )

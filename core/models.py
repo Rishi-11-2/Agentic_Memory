@@ -103,17 +103,13 @@ class ToolInvocation(BaseModel):
     critic_flagged: bool = False
     metadata: dict[str, str] = Field(default_factory=dict)
 
-    def compact_description(self) -> str:
-        """Render a concise tool trace for memory contexts and summaries."""
-        status = "success" if self.success else "failure"
-        return f"{self.tool_name} [{status}] input={self.input_summary} output={self.output_summary}"
-
 
 class EpisodeRecord(BaseModel):
     """Persist an append-only record of a complete actor turn."""
 
     episode_id: str = Field(default_factory=lambda: str(uuid4()))
     prompt_text: str
+    reasoning_summary: str = ""
     prompt_embedding: list[float] = Field(default_factory=list)
     tool_sequence: list[ToolInvocation] = Field(default_factory=list)
     final_response: str = ""

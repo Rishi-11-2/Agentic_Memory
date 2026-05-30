@@ -48,12 +48,14 @@ class PostgresMemoryStore(MemoryStore):
         """Create a connection pool and validate pgvector availability."""
         pool = await asyncpg.create_pool(dsn, min_size=min_size, max_size=max_size)
         async with pool.acquire() as conn:
-            try:
-                await conn.execute("SELECT 1 FROM pg_extension WHERE extname = 'vector'")
-            except Exception:
+            pgvector_installed = await conn.fetchval(
+                "SELECT EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'vector')"
+            )
+            if not pgvector_installed:
                 raise RuntimeError(
                     "pgvector extension is not installed. Run: CREATE EXTENSION IF NOT EXISTS vector;"
                 )
+            await _migrate_schema(conn)
         return cls(pool)
 
     async def close(self) -> None:
@@ -180,11 +182,11 @@ class PostgresMemoryStore(MemoryStore):
 
         async with self._pool.acquire() as conn:
             await conn.execute(
-                f"INSERT INTO am_episodic_memory (episode_id, prompt_text, {vec_col}, tool_sequence, "
+                f"INSERT INTO am_episodic_memory (episode_id, prompt_text, reasoning_summary, {vec_col}, tool_sequence, "
                 "final_response, outcome, error_trace, latency_ms, timestamp) "
-                f"VALUES ($1, $2, $3::vector, $4::jsonb, $5, $6, $7, $8, $9)",
+                f"VALUES ($1, $2, $3, $4::vector, $5::jsonb, $6, $7, $8, $9, $10)",
                 episode.episode_id, episode.prompt_text,
-                _vec_literal(vec_val), tool_seq,
+                episode.reasoning_summary, _vec_literal(vec_val), tool_seq,
                 episode.final_response, episode.outcome.value, episode.error_trace,
                 episode.latency_ms, episode.timestamp,
             )
@@ -497,6 +499,7 @@ class PostgresMemoryStore(MemoryStore):
         return EpisodeRecord(
             episode_id=str(row["episode_id"]),
             prompt_text=str(row["prompt_text"]),
+            reasoning_summary=str(row.get("reasoning_summary") or ""),
             prompt_embedding=embedding,
             tool_sequence=tools,
             final_response=str(row.get("final_response") or ""),
@@ -588,6 +591,33 @@ class PostgresMemoryStore(MemoryStore):
 
 
 # ── Helpers ─────────────────────────────────────────────────────────
+
+
+async def _migrate_schema(conn: asyncpg.Connection) -> None:
+    """Apply additive PostgreSQL migrations for databases created by older releases."""
+    await conn.execute(
+        "ALTER TABLE IF EXISTS am_episodic_memory "
+        "ADD COLUMN IF NOT EXISTS reasoning_summary text NOT NULL DEFAULT ''"
+    )
+    await conn.execute(
+        "ALTER TABLE IF EXISTS am_semantic_memory "
+        "ADD COLUMN IF NOT EXISTS source text NOT NULL DEFAULT 'llm_inferred'"
+    )
+    await conn.execute(
+        "ALTER TABLE IF EXISTS am_semantic_memory "
+        "ADD COLUMN IF NOT EXISTS last_confirmed_at timestamptz"
+    )
+    semantic_table_exists = await conn.fetchval("SELECT to_regclass('public.am_semantic_memory') IS NOT NULL")
+    if semantic_table_exists:
+        await conn.execute(
+            "UPDATE am_semantic_memory "
+            "SET last_confirmed_at = coalesce(last_confirmed_at, last_reinforced_at, created_at, now()) "
+            "WHERE last_confirmed_at IS NULL"
+        )
+        await conn.execute(
+            "ALTER TABLE am_semantic_memory "
+            "ALTER COLUMN last_confirmed_at SET NOT NULL"
+        )
 
 
 def _row_count(command_tag: str) -> int:

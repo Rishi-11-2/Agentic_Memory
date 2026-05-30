@@ -31,8 +31,6 @@ def create_llm_client(settings: Settings) -> StructuredLLMClient:
 
         return AnthropicStructuredClient(
             api_key=settings.anthropic_api_key,
-            actor_model=settings.anthropic_actor_model,
-            critic_model=settings.anthropic_critic_model,
         )
     if settings.llm_provider == "openai":
         from model.openai_client import OpenAIStructuredClient
@@ -40,8 +38,6 @@ def create_llm_client(settings: Settings) -> StructuredLLMClient:
         return OpenAIStructuredClient(
             api_key=settings.openai_api_key,
             base_url=settings.openai_base_url or None,
-            actor_model=settings.openai_actor_model,
-            critic_model=settings.openai_critic_model,
         )
     raise ValueError(f"Unknown LLM_PROVIDER: {settings.llm_provider!r}")
 

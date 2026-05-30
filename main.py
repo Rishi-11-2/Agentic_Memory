@@ -51,7 +51,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         semantic_memory_ttl_days=settings.semantic_memory_ttl_days,
     )
     app.state.components = AppComponents(store=store, planner=planner, memory_service=memory_service)
-    yield
+    try:
+        yield
+    finally:
+        await store.close()
 
 
 app = FastAPI(

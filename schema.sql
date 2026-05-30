@@ -29,6 +29,7 @@ create table if not exists am_conversation_summaries (
 create table if not exists am_episodic_memory (
     episode_id uuid primary key default gen_random_uuid(),
     prompt_text text not null,
+    reasoning_summary text not null default '',
     prompt_embedding vector(384),
     prompt_embedding_hash vector(256),
     tool_sequence jsonb not null default '[]'::jsonb,
@@ -38,6 +39,9 @@ create table if not exists am_episodic_memory (
     latency_ms integer not null default 0 check (latency_ms >= 0),
     timestamp timestamptz not null default now()
 );
+
+alter table am_episodic_memory
+    add column if not exists reasoning_summary text not null default '';
 
 create table if not exists am_failure_episodes (
     failure_id uuid primary key default gen_random_uuid(),
@@ -190,6 +194,7 @@ create or replace function match_episodic_memory(
 returns table (
     episode_id uuid,
     prompt_text text,
+    reasoning_summary text,
     tool_sequence jsonb,
     final_response text,
     outcome text,
@@ -203,6 +208,7 @@ as $$
     select
         e.episode_id,
         e.prompt_text,
+        e.reasoning_summary,
         e.tool_sequence,
         e.final_response,
         e.outcome,

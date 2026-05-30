@@ -255,21 +255,21 @@ async def inspect_memory_layers(
 # ── Internal: Auto Critic Evaluation ────────────────────────────────
 
 # Patterns that indicate user preferences (compiled once at module level)
-_PREFERENCE_PATTERNS: list[tuple[re.Pattern[str], str]] = [
-    (re.compile(r"\bi\s+prefer\s+(.+?)(?:\.|,|$)", re.IGNORECASE), "preference"),
-    (re.compile(r"\balways\s+(?:use|do|prefer|want|include)\s+(.+?)(?:\.|,|$)", re.IGNORECASE), "preference"),
-    (re.compile(r"\bnever\s+(?:use|do|want|include)\s+(.+?)(?:\.|,|$)", re.IGNORECASE), "preference"),
-    (re.compile(r"\bdon'?t\s+(?:ever\s+)?(?:use|do|want|include|show)\s+(.+?)(?:\.|,|$)", re.IGNORECASE), "preference"),
-    (re.compile(r"\bplease\s+(?:always|never|don'?t)\s+(.+?)(?:\.|,|$)", re.IGNORECASE), "preference"),
-    (re.compile(r"\bmy\s+(?:preferred|favorite|default)\s+(?:\w+\s+)?is\s+(.+?)(?:\.|,|$)", re.IGNORECASE), "preference"),
+_PREFERENCE_PATTERNS: list[re.Pattern[str]] = [
+    re.compile(r"\bi\s+prefer\s+(.+?)(?:\.|,|$)", re.IGNORECASE),
+    re.compile(r"\balways\s+(?:use|do|prefer|want|include)\s+(.+?)(?:\.|,|$)", re.IGNORECASE),
+    re.compile(r"\bnever\s+(?:use|do|want|include)\s+(.+?)(?:\.|,|$)", re.IGNORECASE),
+    re.compile(r"\bdon'?t\s+(?:ever\s+)?(?:use|do|want|include|show)\s+(.+?)(?:\.|,|$)", re.IGNORECASE),
+    re.compile(r"\bplease\s+(?:always|never|don'?t)\s+(.+?)(?:\.|,|$)", re.IGNORECASE),
+    re.compile(r"\bmy\s+(?:preferred|favorite|default)\s+(?:\w+\s+)?is\s+(.+?)(?:\.|,|$)", re.IGNORECASE),
 ]
 
 # Patterns for extracting factual statements about the user's environment
-_FACT_PATTERNS: list[tuple[re.Pattern[str], str]] = [
-    (re.compile(r"\bi\s+(?:use|am using|work with|develop in|code in)\s+(.+?)(?:\.|,|$)", re.IGNORECASE), "system_rule"),
-    (re.compile(r"\bmy\s+(?:project|app|system|codebase|stack|setup)\s+(?:uses|is|runs)\s+(.+?)(?:\.|,|$)", re.IGNORECASE), "system_rule"),
-    (re.compile(r"\bwe\s+(?:use|run|deploy|host)\s+(?:on\s+)?(.+?)(?:\.|,|$)", re.IGNORECASE), "system_rule"),
-    (re.compile(r"\bour\s+(?:stack|infrastructure|database|backend|frontend)\s+is\s+(.+?)(?:\.|,|$)", re.IGNORECASE), "system_rule"),
+_FACT_PATTERNS: list[re.Pattern[str]] = [
+    re.compile(r"\bi\s+(?:use|am using|work with|develop in|code in)\s+(.+?)(?:\.|,|$)", re.IGNORECASE),
+    re.compile(r"\bmy\s+(?:project|app|system|codebase|stack|setup)\s+(?:uses|is|runs)\s+(.+?)(?:\.|,|$)", re.IGNORECASE),
+    re.compile(r"\bwe\s+(?:use|run|deploy|host)\s+(?:on\s+)?(.+?)(?:\.|,|$)", re.IGNORECASE),
+    re.compile(r"\bour\s+(?:stack|infrastructure|database|backend|frontend)\s+is\s+(.+?)(?:\.|,|$)", re.IGNORECASE),
 ]
 
 
@@ -317,6 +317,7 @@ async def _auto_evaluate(
                 # Weighted blend: 60% LLM critic, 40% agent self-assessment
                 critic_eval.factual_accuracy = round(0.6 * critic_eval.factual_accuracy + 0.4 * clamped, 1)
                 critic_eval.preference_adherence = round(0.6 * critic_eval.preference_adherence + 0.4 * clamped, 1)
+                critic_eval = _recompute_evaluation(critic_eval)
             return critic_eval
         except Exception as exc:
             logger.warning("critic_evaluation_failed error=%s, falling back to heuristic", exc)
@@ -328,6 +329,11 @@ async def _auto_evaluate(
         user_message=user_message,
         assistant_response=assistant_response,
     )
+
+
+def _recompute_evaluation(evaluation: CriticEvaluation) -> CriticEvaluation:
+    """Re-run CriticEvaluation validators after post-provider score blending."""
+    return CriticEvaluation.model_validate(evaluation.model_dump(mode="json", by_alias=True))
 
 
 def _heuristic_evaluation(
@@ -368,7 +374,6 @@ def _heuristic_evaluation(
     tool_efficiency = base
     if total_tools > 0:
         success_rate = (total_tools - failed_tools) / total_tools
-        tool_efficiency = round(base * success_rate + 10.0 * (1.0 - success_rate) * 0.0, 1)
         tool_efficiency = max(1.0, min(10.0, round(success_rate * 10, 1)))
 
     # Response quality heuristics
@@ -397,7 +402,7 @@ def _heuristic_evaluation(
     # ── 3. Extract preferences from user message ────────────────────
     semantic_facts: list[NewSemanticFact] = []
 
-    for pattern, fact_type in _PREFERENCE_PATTERNS:
+    for pattern in _PREFERENCE_PATTERNS:
         for match in pattern.finditer(user_message):
             extracted = match.group(1).strip()
             if len(extracted) > 5 and len(extracted) < 200:
@@ -413,7 +418,7 @@ def _heuristic_evaluation(
                 )
 
     # ── 4. Extract factual statements about environment ─────────────
-    for pattern, fact_type in _FACT_PATTERNS:
+    for pattern in _FACT_PATTERNS:
         for match in pattern.finditer(user_message):
             extracted = match.group(1).strip()
             if len(extracted) > 3 and len(extracted) < 200:
@@ -440,10 +445,6 @@ def _heuristic_evaluation(
 
     # ── 6. Workflow save decision ───────────────────────────────────
     save_workflow = total_tools >= 2 and failed_tools == 0
-
-    # ── 7. Compute overall score ────────────────────────────────────
-    dimensions = [factual_accuracy, preference_adherence, tool_efficiency, hallucination_risk, workflow_quality]
-    overall = round(sum(dimensions) / len(dimensions), 1)
 
     return CriticEvaluation(
         factual_accuracy=factual_accuracy,

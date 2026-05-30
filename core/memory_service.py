@@ -179,6 +179,7 @@ class AgenticMemoryService:
         outcome = _episode_outcome(actor_result.tool_calls, critic_evaluation)
         episode = EpisodeRecord(
             prompt_text=prompt,
+            reasoning_summary=actor_result.reasoning,
             prompt_embedding=prompt_embedding,
             tool_sequence=actor_result.tool_calls,
             final_response=actor_result.final_response,
@@ -386,6 +387,8 @@ def _render_episode_lines(retrieval_plan: RetrievalPlan) -> list[str]:
     episode = retrieval_plan.episodic_records[0]
     tools = ", ".join(episode.tool_names) or "none"
     lines = [f"Outcome: {episode.outcome.value} | Tools used: {tools}"]
+    if episode.reasoning_summary:
+        lines.append(f"Approach: {_excerpt(episode.reasoning_summary, 240)}")
     if episode.outcome == EpisodeOutcome.FAILURE and episode.error_trace:
         lines.append(f"CAUTION: {episode.error_trace}")
     else:

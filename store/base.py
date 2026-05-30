@@ -19,6 +19,10 @@ from core.models import (
 class MemoryStore(Protocol):
     """Define explicit async persistence operations for every memory layer."""
 
+    async def close(self) -> None:
+        """Release any backend resources owned by the store."""
+        ...
+
     async def next_turn_index(self, session_id: str) -> int:
         """Return the next turn index for the session."""
         ...

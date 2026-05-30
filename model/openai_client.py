@@ -21,8 +21,6 @@ class OpenAIStructuredClient:
 
     def __init__(
         self,
-        actor_model: str = "gpt-4o-mini",
-        critic_model: str = "gpt-4o",
         api_key: str | None = None,
         base_url: str | None = None,
         max_attempts: int = 3,
@@ -30,8 +28,6 @@ class OpenAIStructuredClient:
         """Create an OpenAI async client using OPENAI_API_KEY and optional OPENAI_BASE_URL."""
         from openai import AsyncOpenAI
 
-        self.actor_model = actor_model
-        self.critic_model = critic_model
         resolved_base_url = base_url or os.getenv("OPENAI_BASE_URL", "")
         self._client = AsyncOpenAI(
             api_key=api_key,

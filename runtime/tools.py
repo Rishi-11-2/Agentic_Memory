@@ -8,7 +8,6 @@ import math
 import os
 import re
 import shlex
-import stat
 import textwrap
 from collections.abc import Awaitable, Callable
 from pathlib import Path

@@ -13,4 +13,5 @@ env/
 .ruff_cache/
 
 *.db
+*.db.bak
 data/
