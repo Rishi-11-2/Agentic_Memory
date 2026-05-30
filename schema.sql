@@ -65,6 +65,7 @@ create table if not exists am_semantic_memory (
     confidence_score double precision not null check (confidence_score >= 0.0 and confidence_score <= 1.0),
     source text not null default 'llm_inferred',
     source_episode_id uuid references am_episodic_memory(episode_id) on delete set null,
+    pinned boolean not null default false,
     created_at timestamptz not null default now(),
     last_reinforced_at timestamptz not null default now(),
     last_confirmed_at timestamptz not null default now()
@@ -75,6 +76,9 @@ alter table am_semantic_memory
 
 alter table am_semantic_memory
     add column if not exists last_confirmed_at timestamptz;
+
+alter table am_semantic_memory
+    add column if not exists pinned boolean not null default false;
 
 update am_semantic_memory
 set last_confirmed_at = coalesce(last_confirmed_at, last_reinforced_at, created_at, now())
@@ -94,6 +98,14 @@ create table if not exists am_procedural_workflows (
     embedding vector(384),
     hash_embedding vector(256),
     created_at timestamptz not null default now(),
+    updated_at timestamptz not null default now()
+);
+
+create table if not exists am_retrieval_feedback (
+    session_id text primary key,
+    semantic_weight double precision not null default 1.0,
+    procedural_weight double precision not null default 1.0,
+    episodic_weight double precision not null default 1.0,
     updated_at timestamptz not null default now()
 );
 
@@ -161,6 +173,7 @@ returns table (
     confidence_score double precision,
     source text,
     source_episode_id uuid,
+    pinned boolean,
     created_at timestamptz,
     last_reinforced_at timestamptz,
     last_confirmed_at timestamptz,
@@ -175,6 +188,7 @@ as $$
         m.confidence_score,
         m.source,
         m.source_episode_id,
+        m.pinned,
         m.created_at,
         m.last_reinforced_at,
         m.last_confirmed_at,

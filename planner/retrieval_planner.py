@@ -12,6 +12,7 @@ from core.models import (
     ProceduralWorkflow,
     RetrievedRecord,
     RetrievalPlan,
+    SemanticMemoryRecord,
 )
 from model.embedding_model import EmbeddingModel
 from store.base import MemoryStore
@@ -67,7 +68,7 @@ class HeuristicRetrievalPlanner:
         """Build a retrieval plan and populate it with raw retrieved records."""
         normalized = _normalize(prompt)
         tokens = _tokens(prompt)
-        weights = self._weights_for(session_id)
+        weights = await self._weights_for(session_id)
         semantic_density = _keyword_density(tokens, self._preference_keywords)
         procedural_density = _keyword_density(tokens, self._complexity_keywords)
 
@@ -93,23 +94,27 @@ class HeuristicRetrievalPlanner:
         if query_semantic:
             semantic_records = await self._store.search_semantic(
                 embedding,
-                5,
+                10,
                 0.35,
                 0.6,
                 last_confirmed_after=self._semantic_cutoff(),
             )
+            semantic_records = _rank_semantic_records(semantic_records)[:5]
 
         procedural_workflows = trigger_workflows
         if query_procedural:
-            vector_workflows = await self._store.search_procedural(embedding, 3, 0.40)
-            procedural_workflows = _dedupe_workflows(trigger_workflows + vector_workflows)
+            vector_workflows = await self._store.search_procedural(embedding, 6, 0.40)
+            procedural_workflows = _rank_workflows(_dedupe_workflows(trigger_workflows + vector_workflows))[:3]
 
         base_episode_threshold = 0.45 if _contains_any(normalized, self._history_keywords) else 0.55
         episode_threshold = max(0.25, min(0.85, base_episode_threshold / weights["episodic"]))
-        episodic_records = await self._store.search_episodes(embedding, 3, episode_threshold)
+        episodic_records = _rank_episodes(
+            await self._store.search_episodes(embedding, 6, episode_threshold)
+        )[:3]
         failure_matches = await self._store.search_failures(
-            embedding, 3, self._failure_similarity_threshold
+            embedding, 6, self._failure_similarity_threshold
         )
+        failure_matches = _rank_failures(failure_matches)[:3]
         query_episodic = bool(episodic_records or failure_matches)
 
         rationale = {
@@ -134,7 +139,7 @@ class HeuristicRetrievalPlanner:
             query_semantic=query_semantic,
             query_procedural=query_procedural,
             min_confidence=0.6,
-            episodic_similarity_threshold=self._failure_similarity_threshold,
+            episodic_similarity_threshold=episode_threshold,
             rationale=rationale,
             conversational_records=conversational,
             conversation_summaries=summaries,
@@ -145,9 +150,9 @@ class HeuristicRetrievalPlanner:
             retrieved_records=retrieved,
         )
 
-    def record_feedback(self, session_id: str, retrieval_plan: RetrievalPlan, critic_passed: bool) -> None:
+    async def record_feedback(self, session_id: str, retrieval_plan: RetrievalPlan, critic_passed: bool) -> None:
         """Update per-session retrieval weights from observed turn quality."""
-        weights = self._weights_for(session_id)
+        weights = await self._weights_for(session_id)
         retrieved = {
             "semantic": bool(retrieval_plan.semantic_records),
             "procedural": bool(retrieval_plan.procedural_workflows),
@@ -158,11 +163,13 @@ class HeuristicRetrievalPlanner:
                 continue
             target = 1.15 if critic_passed else 0.85
             weights[layer] = max(0.5, min(1.5, (0.85 * weights[layer]) + (0.15 * target)))
+        await self._store.save_retrieval_weights(session_id, weights)
 
-    def _weights_for(self, session_id: str) -> dict[str, float]:
+    async def _weights_for(self, session_id: str) -> dict[str, float]:
         """Return mutable EMA weights for one session."""
         if session_id not in self._session_weights:
-            self._session_weights[session_id] = {"semantic": 1.0, "procedural": 1.0, "episodic": 1.0}
+            persisted = await self._store.get_retrieval_weights(session_id)
+            self._session_weights[session_id] = _normalize_weights(persisted)
         return self._session_weights[session_id]
 
     def _semantic_cutoff(self) -> datetime | None:
@@ -284,3 +291,83 @@ def _dedupe_workflows(workflows: list[ProceduralWorkflow]) -> list[ProceduralWor
         seen.add(workflow.workflow_id)
         deduped.append(workflow)
     return deduped
+
+
+def _rank_semantic_records(records: list[SemanticMemoryRecord]) -> list[SemanticMemoryRecord]:
+    """Re-rank semantic facts by similarity, confidence, freshness, and pinning."""
+    for record in records:
+        similarity = record.score or 0.0
+        confidence = record.confidence_score
+        recency = _recency_score(record.last_confirmed_at, half_life_days=45)
+        pinned_bonus = 1.0 if getattr(record, "pinned", False) else 0.0
+        record.score = _clip_score((0.55 * similarity) + (0.30 * confidence) + (0.10 * recency) + (0.05 * pinned_bonus))
+    records.sort(key=lambda item: item.score or 0.0, reverse=True)
+    return records
+
+
+def _rank_episodes(records: list[EpisodeRecord]) -> list[EpisodeRecord]:
+    """Re-rank episodes by similarity, outcome quality, recency, and tool success."""
+    outcome_score = {"success": 1.0, "partial": 0.55, "failure": 0.20}
+    for record in records:
+        similarity = record.score or 0.0
+        outcome = outcome_score.get(record.outcome.value, 0.5)
+        recency = _recency_score(record.timestamp, half_life_days=30)
+        if record.tool_sequence:
+            tool_success = sum(1 for tool in record.tool_sequence if tool.success) / len(record.tool_sequence)
+        else:
+            tool_success = 0.7
+        record.score = _clip_score((0.60 * similarity) + (0.20 * outcome) + (0.15 * recency) + (0.05 * tool_success))
+    records.sort(key=lambda item: item.score or 0.0, reverse=True)
+    return records
+
+
+def _rank_failures(records: list[FailureEpisode]) -> list[FailureEpisode]:
+    """Re-rank failures by similarity and recency so fresh hazards surface quickly."""
+    for record in records:
+        similarity = record.score or 0.0
+        recency = _recency_score(record.timestamp, half_life_days=21)
+        record.score = _clip_score((0.70 * similarity) + (0.30 * recency))
+    records.sort(key=lambda item: item.score or 0.0, reverse=True)
+    return records
+
+
+def _rank_workflows(workflows: list[ProceduralWorkflow]) -> list[ProceduralWorkflow]:
+    """Re-rank workflows by similarity, success maturity, canonical status, and recency."""
+    for workflow in workflows:
+        similarity = workflow.score or 0.0
+        maturity = min(1.0, workflow.success_count / 5)
+        status = 1.0 if workflow.status.value == "canonical" else 0.45
+        recency = _recency_score(workflow.updated_at, half_life_days=60)
+        trigger_score = 1.0 if similarity == 0.0 else similarity
+        workflow.score = _clip_score((0.35 * trigger_score) + (0.30 * maturity) + (0.20 * status) + (0.15 * recency))
+    workflows.sort(key=lambda item: item.score or 0.0, reverse=True)
+    return workflows
+
+
+def _recency_score(value: datetime, half_life_days: int) -> float:
+    """Score recency as a smooth 0..1 decay."""
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    age_days = max(0.0, (datetime.now(timezone.utc) - value.astimezone(timezone.utc)).total_seconds() / 86400)
+    return 1.0 / (1.0 + (age_days / max(1, half_life_days)))
+
+
+def _clip_score(value: float) -> float:
+    """Clip retrieval score into the Pydantic-safe range."""
+    return max(0.0, min(1.0, round(value, 4)))
+
+
+def _normalize_weights(weights: dict[str, float] | None) -> dict[str, float]:
+    """Return all planner weights with safe defaults and bounds."""
+    source = weights or {}
+    return {
+        "semantic": _clip_weight(source.get("semantic", 1.0)),
+        "procedural": _clip_weight(source.get("procedural", 1.0)),
+        "episodic": _clip_weight(source.get("episodic", 1.0)),
+    }
+
+
+def _clip_weight(value: object) -> float:
+    """Clip one adaptive planner weight."""
+    parsed = float(value) if isinstance(value, (int, float, str)) else 1.0
+    return max(0.5, min(1.5, parsed))

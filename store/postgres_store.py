@@ -32,7 +32,7 @@ from store.base import MemoryStore
 
 
 class PostgresMemoryStore(MemoryStore):
-    """Persist all four memory layers in a local PostgreSQL database with pgvector.
+    """Persist all memory layers in a local PostgreSQL database with pgvector.
 
     Uses the same tables, indexes, and RPC functions defined in schema.sql.
     Server-side cosine similarity via the pgvector ``<=>`` operator provides
@@ -213,6 +213,15 @@ class PostgresMemoryStore(MemoryStore):
             )
         return self._rank_episodes(rows, embedding, threshold, limit)
 
+    async def get_episode(self, episode_id: str) -> EpisodeRecord | None:
+        """Return one episodic memory record by id."""
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT * FROM am_episodic_memory WHERE episode_id = $1",
+                episode_id,
+            )
+        return self._episode_from_row(row) if row is not None else None
+
     # ── Failure ─────────────────────────────────────────────────────
 
     async def save_failure_episode(self, failure: FailureEpisode) -> FailureEpisode:
@@ -262,13 +271,54 @@ class PostgresMemoryStore(MemoryStore):
         async with self._pool.acquire() as conn:
             await conn.execute(
                 f"INSERT INTO am_semantic_memory (fact_id, fact_type, content, {vec_col}, "
-                "confidence_score, source, source_episode_id, created_at, last_reinforced_at, last_confirmed_at) "
-                f"VALUES ($1, $2, $3, $4::vector, $5, $6, $7, $8, $9, $10)",
+                "confidence_score, source, source_episode_id, pinned, created_at, last_reinforced_at, last_confirmed_at) "
+                f"VALUES ($1, $2, $3, $4::vector, $5, $6, $7, $8, $9, $10, $11)",
                 record.fact_id, record.fact_type.value, record.content,
                 _vec_literal(vec_val), record.confidence_score, record.source, record.source_episode_id,
-                record.created_at, record.last_reinforced_at, record.last_confirmed_at,
+                record.pinned, record.created_at, record.last_reinforced_at, record.last_confirmed_at,
             )
         return record
+
+    async def delete_semantic(self, fact_id: str) -> bool:
+        """Delete one semantic memory fact."""
+        async with self._pool.acquire() as conn:
+            result = await conn.execute(
+                "DELETE FROM am_semantic_memory WHERE fact_id = $1",
+                fact_id,
+            )
+        return _row_count(result) > 0
+
+    async def update_semantic_metadata(
+        self,
+        fact_id: str,
+        *,
+        confidence_score: float | None = None,
+        pinned: bool | None = None,
+        last_confirmed_at: datetime | None = None,
+    ) -> bool:
+        """Update management metadata for one semantic fact."""
+        fields: list[str] = []
+        values: list[Any] = []
+        if confidence_score is not None:
+            values.append(max(0.0, min(1.0, confidence_score)))
+            fields.append(f"confidence_score = ${len(values)}")
+        if pinned is not None:
+            values.append(pinned)
+            fields.append(f"pinned = ${len(values)}")
+        if last_confirmed_at is not None:
+            values.append(last_confirmed_at)
+            fields.append(f"last_confirmed_at = ${len(values)}")
+        if not fields:
+            return False
+        values.append(utc_now())
+        fields.append(f"last_reinforced_at = ${len(values)}")
+        values.append(fact_id)
+        async with self._pool.acquire() as conn:
+            result = await conn.execute(
+                f"UPDATE am_semantic_memory SET {', '.join(fields)} WHERE fact_id = ${len(values)}",  # noqa: S608
+                *values,
+            )
+        return _row_count(result) > 0
 
     async def reinforce_semantic(
         self, fact_id: str, confidence_score: float | None = None, source: str | None = None
@@ -296,14 +346,15 @@ class PostgresMemoryStore(MemoryStore):
         async with self._pool.acquire() as conn:
             await conn.execute(
                 f"UPDATE am_semantic_memory SET fact_type = $1, content = $2, {vec_col} = $3::vector, "
-                "confidence_score = $4, source = $5, source_episode_id = $6, last_reinforced_at = $7, "
-                "last_confirmed_at = $8 WHERE fact_id = $9",
+                "confidence_score = $4, source = $5, source_episode_id = $6, pinned = $7, last_reinforced_at = $8, "
+                "last_confirmed_at = $9 WHERE fact_id = $10",
                 record.fact_type.value,
                 record.content,
                 _vec_literal(vec_val),
                 record.confidence_score,
                 record.source,
                 record.source_episode_id,
+                record.pinned,
                 record.last_reinforced_at,
                 record.last_confirmed_at,
                 fact_id,
@@ -326,7 +377,7 @@ class PostgresMemoryStore(MemoryStore):
                     "SELECT *, 1 - (embedding <=> $1::vector) AS similarity "
                     "FROM am_semantic_memory WHERE embedding IS NOT NULL "
                     "AND confidence_score >= $4 "
-                    "AND ($5::timestamptz IS NULL OR last_confirmed_at >= $5::timestamptz) "
+                    "AND ($5::timestamptz IS NULL OR last_confirmed_at >= $5::timestamptz OR pinned) "
                     "AND 1 - (embedding <=> $1::vector) >= $2 "
                     "ORDER BY embedding <=> $1::vector LIMIT $3",
                     _vec_literal(embedding), threshold, limit, min_confidence, last_confirmed_after,
@@ -335,7 +386,7 @@ class PostgresMemoryStore(MemoryStore):
         async with self._pool.acquire() as conn:
             rows = await conn.fetch(
                 "SELECT * FROM am_semantic_memory WHERE confidence_score >= $1 "
-                "AND ($2::timestamptz IS NULL OR last_confirmed_at >= $2::timestamptz) LIMIT 200",
+                "AND ($2::timestamptz IS NULL OR last_confirmed_at >= $2::timestamptz OR pinned) LIMIT 200",
                 min_confidence, last_confirmed_after,
             )
         return self._rank_semantic(rows, embedding, threshold, limit)
@@ -463,6 +514,55 @@ class PostgresMemoryStore(MemoryStore):
             )
         return int(value or 0)
 
+    async def prune_episodes_before(self, cutoff: datetime) -> int:
+        """Delete episodic memories older than a cutoff and detach related failures."""
+        async with self._pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE am_failure_episodes SET episode_id = NULL WHERE episode_id IN "
+                "(SELECT episode_id FROM am_episodic_memory WHERE timestamp < $1)",
+                cutoff,
+            )
+            result = await conn.execute(
+                "DELETE FROM am_episodic_memory WHERE timestamp < $1",
+                cutoff,
+            )
+        return _row_count(result)
+
+    async def get_retrieval_weights(self, session_id: str) -> dict[str, float] | None:
+        """Return persisted planner feedback weights for a session."""
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT semantic_weight, procedural_weight, episodic_weight FROM am_retrieval_feedback "
+                "WHERE session_id = $1",
+                session_id,
+            )
+        if row is None:
+            return None
+        return {
+            "semantic": float(row["semantic_weight"]),
+            "procedural": float(row["procedural_weight"]),
+            "episodic": float(row["episodic_weight"]),
+        }
+
+    async def save_retrieval_weights(self, session_id: str, weights: dict[str, float]) -> None:
+        """Persist planner feedback weights for a session."""
+        async with self._pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO am_retrieval_feedback "
+                "(session_id, semantic_weight, procedural_weight, episodic_weight, updated_at) "
+                "VALUES ($1, $2, $3, $4, $5) "
+                "ON CONFLICT (session_id) DO UPDATE SET "
+                "semantic_weight = excluded.semantic_weight, "
+                "procedural_weight = excluded.procedural_weight, "
+                "episodic_weight = excluded.episodic_weight, "
+                "updated_at = excluded.updated_at",
+                session_id,
+                _clamp_weight(weights.get("semantic")),
+                _clamp_weight(weights.get("procedural")),
+                _clamp_weight(weights.get("episodic")),
+                utc_now(),
+            )
+
     # ── Row Parsers ─────────────────────────────────────────────────
 
     def _conv_from_row(self, row: Any) -> ConversationalTurnRecord:
@@ -540,6 +640,7 @@ class PostgresMemoryStore(MemoryStore):
             confidence_score=float(row["confidence_score"]),
             source=str(row.get("source") or "llm_inferred"),
             source_episode_id=cast(str | None, row.get("source_episode_id")),
+            pinned=bool(row.get("pinned")),
             created_at=row.get("created_at") or utc_now(),
             last_reinforced_at=row.get("last_reinforced_at") or utc_now(),
             last_confirmed_at=row.get("last_confirmed_at") or row.get("last_reinforced_at") or utc_now(),
@@ -606,6 +707,18 @@ async def _migrate_schema(conn: asyncpg.Connection) -> None:
     await conn.execute(
         "ALTER TABLE IF EXISTS am_semantic_memory "
         "ADD COLUMN IF NOT EXISTS last_confirmed_at timestamptz"
+    )
+    await conn.execute(
+        "ALTER TABLE IF EXISTS am_semantic_memory "
+        "ADD COLUMN IF NOT EXISTS pinned boolean NOT NULL DEFAULT false"
+    )
+    await conn.execute(
+        "CREATE TABLE IF NOT EXISTS am_retrieval_feedback ("
+        "session_id text primary key, "
+        "semantic_weight double precision not null default 1.0, "
+        "procedural_weight double precision not null default 1.0, "
+        "episodic_weight double precision not null default 1.0, "
+        "updated_at timestamptz not null default now())"
     )
     semantic_table_exists = await conn.fetchval("SELECT to_regclass('public.am_semantic_memory') IS NOT NULL")
     if semantic_table_exists:
@@ -709,3 +822,9 @@ def _client_rank(rows: list[Any], embedding: list[float], col: str, threshold: f
             scored.append((sim, enriched))
     scored.sort(key=lambda x: x[0], reverse=True)
     return [row for _, row in scored[:limit]]
+
+
+def _clamp_weight(value: object) -> float:
+    """Clamp persisted planner feedback weights to the supported range."""
+    parsed = float(value) if isinstance(value, (int, float, str)) else 1.0
+    return max(0.5, min(1.5, parsed))

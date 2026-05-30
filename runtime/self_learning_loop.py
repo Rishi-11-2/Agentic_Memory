@@ -81,7 +81,7 @@ class SelfLearningLoop:
                 session_id=session_id,
                 loop_latency_ms=total_latency_ms,
             )
-            self._planner.record_feedback(session_id, retrieval_plan, critic_evaluation.passed)
+            await self._planner.record_feedback(session_id, retrieval_plan, critic_evaluation.passed)
         phase_timings_ms["consolidation"] = _log_phase("consolidation", session_id, phase_started)
 
         phase_started = perf_counter()

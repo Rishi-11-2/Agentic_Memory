@@ -15,20 +15,19 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import re
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from typing import Any, Literal
 
 from fastmcp import FastMCP
 
 from config import Settings, load_settings
+from core.evaluation_service import AutoEvaluationService
 from core.memory_service import AgenticMemoryService
 from core.models import (
     ActorResult,
-    CriticEvaluation,
     MemoryLayer,
-    NewSemanticFact,
-    SemanticFactType,
+    SemanticMemoryRecord,
     ToolInvocation,
 )
 from model.embedding_model import EmbeddingModel, create_embedding_model
@@ -52,6 +51,7 @@ class MCPComponents:
     embedding_model: EmbeddingModel
     planner: HeuristicRetrievalPlanner
     memory_service: AgenticMemoryService
+    evaluation_service: AutoEvaluationService
     critic: Any = field(default=None)  # Critic instance, None if no LLM configured
     learning_loop: Any = field(default=None)  # SelfLearningLoop, None unless standalone enabled
 
@@ -129,10 +129,13 @@ async def consolidate_turn(
         reasoning=reasoning_summary or "",
     )
 
-    # Auto-evaluate using the Critic LLM if available, otherwise use enhanced heuristics
-    critic_evaluation = await _auto_evaluate(
-        components, user_message, assistant_response, actor_result,
-        new_facts, failure_summary, quality_score,
+    critic_evaluation = await components.evaluation_service.evaluate(
+        user_message=user_message,
+        assistant_response=assistant_response,
+        actor_result=actor_result,
+        new_facts=new_facts,
+        failure_summary=failure_summary,
+        quality_score=quality_score,
     )
 
     # Consolidate into all memory layers
@@ -146,7 +149,7 @@ async def consolidate_turn(
 
     # Feed critic result back to planner for retrieval weight tuning
     plan = await components.planner.plan(user_message, session_id)
-    components.planner.record_feedback(session_id, plan, critic_evaluation.passed)
+    await components.planner.record_feedback(session_id, plan, critic_evaluation.passed)
 
     return json.dumps(
         {
@@ -252,209 +255,117 @@ async def inspect_memory_layers(
     )
 
 
-# ── Internal: Auto Critic Evaluation ────────────────────────────────
-
-# Patterns that indicate user preferences (compiled once at module level)
-_PREFERENCE_PATTERNS: list[re.Pattern[str]] = [
-    re.compile(r"\bi\s+prefer\s+(.+?)(?:\.|,|$)", re.IGNORECASE),
-    re.compile(r"\balways\s+(?:use|do|prefer|want|include)\s+(.+?)(?:\.|,|$)", re.IGNORECASE),
-    re.compile(r"\bnever\s+(?:use|do|want|include)\s+(.+?)(?:\.|,|$)", re.IGNORECASE),
-    re.compile(r"\bdon'?t\s+(?:ever\s+)?(?:use|do|want|include|show)\s+(.+?)(?:\.|,|$)", re.IGNORECASE),
-    re.compile(r"\bplease\s+(?:always|never|don'?t)\s+(.+?)(?:\.|,|$)", re.IGNORECASE),
-    re.compile(r"\bmy\s+(?:preferred|favorite|default)\s+(?:\w+\s+)?is\s+(.+?)(?:\.|,|$)", re.IGNORECASE),
-]
-
-# Patterns for extracting factual statements about the user's environment
-_FACT_PATTERNS: list[re.Pattern[str]] = [
-    re.compile(r"\bi\s+(?:use|am using|work with|develop in|code in)\s+(.+?)(?:\.|,|$)", re.IGNORECASE),
-    re.compile(r"\bmy\s+(?:project|app|system|codebase|stack|setup)\s+(?:uses|is|runs)\s+(.+?)(?:\.|,|$)", re.IGNORECASE),
-    re.compile(r"\bwe\s+(?:use|run|deploy|host)\s+(?:on\s+)?(.+?)(?:\.|,|$)", re.IGNORECASE),
-    re.compile(r"\bour\s+(?:stack|infrastructure|database|backend|frontend)\s+is\s+(.+?)(?:\.|,|$)", re.IGNORECASE),
-]
+@mcp.tool()
+async def delete_semantic_fact(fact_id: str) -> str:
+    """Delete one semantic fact by id."""
+    components = await _components()
+    deleted = await components.store.delete_semantic(fact_id)
+    return json.dumps({"deleted": deleted, "fact_id": fact_id}, ensure_ascii=False)
 
 
-async def _auto_evaluate(
-    components: MCPComponents,
-    user_message: str,
-    assistant_response: str,
-    actor_result: ActorResult,
-    new_facts: list[str] | None,
-    failure_summary: str | None,
-    quality_score: float | None = None,
-) -> CriticEvaluation:
-    """Run the Critic LLM if available, otherwise build an enhanced heuristic evaluation.
+@mcp.tool()
+async def pin_semantic_fact(fact_id: str, pinned: bool = True) -> str:
+    """Pin or unpin a semantic fact so TTL filtering does not hide it."""
+    components = await _components()
+    updated = await components.store.update_semantic_metadata(fact_id, pinned=pinned)
+    return json.dumps({"updated": updated, "fact_id": fact_id, "pinned": pinned}, ensure_ascii=False)
 
-    When an LLM provider is configured, the Critic evaluates the turn across
-    five quality dimensions and extracts semantic facts automatically.
-    When no LLM is configured, an enhanced heuristic evaluation is built from
-    the agent self-score, tool signals, user message patterns, and response quality.
-    """
-    facts_list = new_facts or []
 
-    if components.critic is not None:
-        try:
-            # Build a minimal memory context for the critic to evaluate against
-            plan = await components.planner.plan(user_message, "critic-eval")
-            memory_context = await components.memory_service.build_context(plan)
-            critic_eval = await components.critic.evaluate(user_message, memory_context, actor_result)
-            # Merge any agent-supplied facts with critic-discovered facts
-            if facts_list:
-                agent_facts = [
-                    NewSemanticFact(
-                        fact_type=SemanticFactType.INFERRED_FACT,
-                        content=fact,
-                        confidence=0.85,
-                        source="llm_inferred",
-                    )
-                    for fact in facts_list
-                ]
-                critic_eval.new_semantic_facts.extend(agent_facts)
-            if failure_summary and not critic_eval.failure_summary:
-                critic_eval.failure_summary = failure_summary
-            # If the agent provided a self-score, blend it with the LLM critic score
-            if quality_score is not None:
-                clamped = max(0.0, min(10.0, quality_score))
-                # Weighted blend: 60% LLM critic, 40% agent self-assessment
-                critic_eval.factual_accuracy = round(0.6 * critic_eval.factual_accuracy + 0.4 * clamped, 1)
-                critic_eval.preference_adherence = round(0.6 * critic_eval.preference_adherence + 0.4 * clamped, 1)
-                critic_eval = _recompute_evaluation(critic_eval)
-            return critic_eval
-        except Exception as exc:
-            logger.warning("critic_evaluation_failed error=%s, falling back to heuristic", exc)
-
-    # Enhanced heuristic: build evaluation from agent self-score, tool signals, and patterns
-    return _heuristic_evaluation(
-        actor_result, facts_list, failure_summary,
-        quality_score=quality_score,
-        user_message=user_message,
-        assistant_response=assistant_response,
+@mcp.tool()
+async def mark_semantic_fact_stale(fact_id: str, stale_days: int = 365) -> str:
+    """Mark a semantic fact as stale by moving its confirmation timestamp into the past."""
+    components = await _components()
+    days = max(1, min(int(stale_days), 3650))
+    stale_at = datetime.now(timezone.utc) - timedelta(days=days)
+    updated = await components.store.update_semantic_metadata(
+        fact_id,
+        pinned=False,
+        last_confirmed_at=stale_at,
+    )
+    return json.dumps(
+        {"updated": updated, "fact_id": fact_id, "last_confirmed_at": stale_at.isoformat()},
+        ensure_ascii=False,
     )
 
 
-def _recompute_evaluation(evaluation: CriticEvaluation) -> CriticEvaluation:
-    """Re-run CriticEvaluation validators after post-provider score blending."""
-    return CriticEvaluation.model_validate(evaluation.model_dump(mode="json", by_alias=True))
+@mcp.tool()
+async def inspect_episode(episode_id: str) -> str:
+    """Return one full episodic memory record by id."""
+    components = await _components()
+    episode = await components.store.get_episode(episode_id)
+    if episode is None:
+        return json.dumps({"found": False, "episode_id": episode_id}, ensure_ascii=False)
+    return episode.model_dump_json()
 
 
-def _heuristic_evaluation(
-    actor_result: ActorResult,
-    facts: list[str],
-    failure_summary: str | None,
-    quality_score: float | None = None,
-    user_message: str = "",
-    assistant_response: str = "",
-) -> CriticEvaluation:
-    """Build an enhanced CriticEvaluation using multi-signal analysis.
+@mcp.tool()
+async def prune_old_episodes(older_than_days: int = 180) -> str:
+    """Delete episodic memories older than the requested age, preserving detached failure records."""
+    components = await _components()
+    days = max(1, min(int(older_than_days), 3650))
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    deleted = await components.store.prune_episodes_before(cutoff)
+    return json.dumps(
+        {"deleted": deleted, "older_than_days": days, "cutoff": cutoff.isoformat()},
+        ensure_ascii=False,
+    )
 
-    When no LLM Critic is available (the common case for MCP usage with
-    Claude/Codex), this evaluator scores quality from:
-    1. Agent self-score (quality_score) — highest-priority signal
-    2. Tool success/failure rates
-    3. Response quality heuristics (length ratio, structure, errors)
-    4. Pattern-based preference and fact extraction from the user message
+
+@mcp.tool()
+async def export_memory(
+    layers: list[Literal["conversational", "episodic", "semantic", "procedural", "failure"]] | None = None,
+    limit_per_layer: int = 100,
+) -> str:
+    """Export recent memory records by layer as JSON."""
+    components = await _components()
+    selected = layers or ["conversational", "episodic", "semantic", "procedural", "failure"]
+    limit = max(1, min(int(limit_per_layer), 1000))
+    result: dict[str, Any] = {}
+    for layer_name in selected:
+        layer = MemoryLayer(layer_name)
+        result[layer.value] = await components.store.inspect_layer(layer, limit, 0)
+    return json.dumps(result, default=str, ensure_ascii=False)
+
+
+@mcp.tool()
+async def import_memory(memory_json: str, import_semantic: bool = True) -> str:
+    """Import semantic memories from an export payload.
+
+    Non-semantic layers are intentionally skipped because they are append-only audit records
+    with cross-table relationships.
     """
-    total_tools = len(actor_result.tool_calls)
-    failed_tools = sum(1 for t in actor_result.tool_calls if not t.success)
-    has_failures = failed_tools > 0 or failure_summary is not None
-
-    # ── 1. Compute base scores ──────────────────────────────────────
-    if quality_score is not None:
-        # Agent self-assessment is the primary signal — it knows best
-        base = max(0.0, min(10.0, quality_score))
-    elif has_failures and total_tools > 0 and failed_tools == total_tools:
-        base = 3.0  # All tools failed
-    elif has_failures:
-        base = 6.0  # Partial failure
-    elif total_tools > 0:
-        base = 9.0  # All tools succeeded
-    else:
-        base = 7.5  # No tools used, neutral baseline
-
-    # ── 2. Dimension-specific adjustments ───────────────────────────
-    tool_efficiency = base
-    if total_tools > 0:
-        success_rate = (total_tools - failed_tools) / total_tools
-        tool_efficiency = max(1.0, min(10.0, round(success_rate * 10, 1)))
-
-    # Response quality heuristics
-    factual_accuracy = base
-    response_len = len(assistant_response)
-    prompt_len = max(len(user_message), 1)
-    if response_len < 10 and prompt_len > 20:
-        factual_accuracy = max(base - 2.0, 1.0)  # Suspiciously short response
-    elif response_len > prompt_len * 0.3:
-        factual_accuracy = min(base + 0.5, 10.0)  # Reasonable length
-
-    # Hallucination risk: higher score = lower risk, better grounded
-    hallucination_risk = base
-    if total_tools > 0 and failed_tools == 0:
-        hallucination_risk = min(base + 1.0, 10.0)  # Tool-grounded = lower risk
-    if failure_summary:
-        hallucination_risk = max(base - 1.5, 1.0)
-
-    # Workflow quality
-    workflow_quality = base
-    if total_tools >= 2 and failed_tools == 0:
-        workflow_quality = min(base + 1.0, 10.0)  # Multi-tool success
-
-    preference_adherence = base  # Can't assess without memory context
-
-    # ── 3. Extract preferences from user message ────────────────────
-    semantic_facts: list[NewSemanticFact] = []
-
-    for pattern in _PREFERENCE_PATTERNS:
-        for match in pattern.finditer(user_message):
-            extracted = match.group(1).strip()
-            if len(extracted) > 5 and len(extracted) < 200:
-                # Build the full preference statement for context
-                full_match = match.group(0).strip().rstrip(".,")
-                semantic_facts.append(
-                    NewSemanticFact(
-                        fact_type=SemanticFactType.PREFERENCE,
-                        content=f"User preference: {full_match}",
-                        confidence=0.90,
-                        source="user_stated",
-                    )
-                )
-
-    # ── 4. Extract factual statements about environment ─────────────
-    for pattern in _FACT_PATTERNS:
-        for match in pattern.finditer(user_message):
-            extracted = match.group(1).strip()
-            if len(extracted) > 3 and len(extracted) < 200:
-                full_match = match.group(0).strip().rstrip(".,")
-                semantic_facts.append(
-                    NewSemanticFact(
-                        fact_type=SemanticFactType.SYSTEM_RULE,
-                        content=f"Environment fact: {full_match}",
-                        confidence=0.80,
-                        source="user_stated",
-                    )
-                )
-
-    # ── 5. Include agent-supplied facts ─────────────────────────────
-    for fact in facts:
-        semantic_facts.append(
-            NewSemanticFact(
-                fact_type=SemanticFactType.INFERRED_FACT,
-                content=fact,
-                confidence=0.85,
-                source="llm_inferred",
-            )
-        )
-
-    # ── 6. Workflow save decision ───────────────────────────────────
-    save_workflow = total_tools >= 2 and failed_tools == 0
-
-    return CriticEvaluation(
-        factual_accuracy=factual_accuracy,
-        preference_adherence=preference_adherence,
-        tool_efficiency=tool_efficiency,
-        hallucination_risk=hallucination_risk,
-        workflow_quality=workflow_quality,
-        new_semantic_facts=semantic_facts,
-        save_workflow=save_workflow,
-        failure_summary=failure_summary,
+    components = await _components()
+    payload = json.loads(memory_json)
+    if not isinstance(payload, dict):
+        raise ValueError("memory_json must decode to a JSON object")
+    imported = 0
+    skipped = 0
+    errors: list[str] = []
+    semantic_records = payload.get("semantic", []) if import_semantic else []
+    if not isinstance(semantic_records, list):
+        raise ValueError("memory_json semantic field must be a list when present")
+    for item in semantic_records:
+        if not isinstance(item, dict):
+            skipped += 1
+            continue
+        try:
+            record = SemanticMemoryRecord.model_validate(item)
+            if not record.embedding:
+                record.embedding = await components.embedding_model.embed(record.content)
+            await components.store.insert_semantic(record)
+            imported += 1
+        except Exception as exc:
+            skipped += 1
+            if len(errors) < 5:
+                errors.append(str(exc))
+    return json.dumps(
+        {
+            "imported_semantic": imported,
+            "skipped": skipped,
+            "errors": errors,
+            "non_semantic_layers": "skipped",
+        },
+        ensure_ascii=False,
     )
 
 
@@ -535,12 +446,18 @@ async def _components() -> MCPComponents:
                 )
                 logger.info("standalone_loop_initialized provider=%s", settings.llm_provider)
 
+        evaluation_service = AutoEvaluationService(
+            critic=critic,
+            planner=planner,
+            memory_service=memory_service,
+        )
         _COMPONENTS = MCPComponents(
             settings=settings,
             store=store,
             embedding_model=embedding_model,
             planner=planner,
             memory_service=memory_service,
+            evaluation_service=evaluation_service,
             critic=critic,
             learning_loop=learning_loop,
         )

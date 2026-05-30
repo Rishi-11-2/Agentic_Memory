@@ -58,7 +58,7 @@ class ExtractiveSummaryProvider:
 
 
 class AgenticMemoryService:
-    """Own context rendering and all four consolidation write paths."""
+    """Own context rendering and all consolidation write paths."""
 
     def __init__(
         self,
@@ -94,17 +94,26 @@ class AgenticMemoryService:
         preferences = [
             fact for fact in retrieval_plan.semantic_records if fact.fact_type == SemanticFactType.PREFERENCE
         ]
+        inferred_facts = [
+            fact for fact in retrieval_plan.semantic_records if fact.fact_type == SemanticFactType.INFERRED_FACT
+        ]
 
         lines.append("[SYSTEM RULES]")
         lines.extend(_render_semantic_lines(system_rules))
         lines.append("")
         lines.append("[USER PREFERENCES]")
         lines.extend(_render_semantic_lines(preferences))
+        lines.append("")
+        lines.append("[KNOWN FACTS]")
+        lines.extend(_render_semantic_lines(inferred_facts))
 
         if retrieval_plan.procedural_workflows:
             lines.append("")
-            lines.append("[SUGGESTED WORKFLOW]")
-            lines.extend(_render_workflow_lines(retrieval_plan.procedural_workflows[0]))
+            lines.append("[SUGGESTED WORKFLOWS]")
+            for index, workflow in enumerate(retrieval_plan.procedural_workflows, start=1):
+                if len(retrieval_plan.procedural_workflows) > 1:
+                    lines.append(f"Workflow {index} (score={workflow.score if workflow.score is not None else 'n/a'}):")
+                lines.extend(_render_workflow_lines(workflow))
 
         lines.append("")
         lines.append("[RECENT CONVERSATION]")

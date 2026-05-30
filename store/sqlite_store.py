@@ -86,6 +86,7 @@ CREATE TABLE IF NOT EXISTS am_semantic_memory (
     confidence_score REAL NOT NULL CHECK (confidence_score >= 0.0 AND confidence_score <= 1.0),
     source TEXT NOT NULL DEFAULT 'llm_inferred',
     source_episode_id TEXT,
+    pinned INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL,
     last_reinforced_at TEXT NOT NULL,
     last_confirmed_at TEXT NOT NULL
@@ -106,11 +107,19 @@ CREATE TABLE IF NOT EXISTS am_procedural_workflows (
 
 CREATE INDEX IF NOT EXISTS idx_conv_session ON am_conversation_turns (session_id, turn_index DESC);
 CREATE INDEX IF NOT EXISTS idx_summ_session ON am_conversation_summaries (session_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS am_retrieval_feedback (
+    session_id TEXT PRIMARY KEY,
+    semantic_weight REAL NOT NULL DEFAULT 1.0,
+    procedural_weight REAL NOT NULL DEFAULT 1.0,
+    episodic_weight REAL NOT NULL DEFAULT 1.0,
+    updated_at TEXT NOT NULL
+);
 """
 
 
 class SQLiteMemoryStore(MemoryStore):
-    """Persist all four memory layers in a local SQLite database.
+    """Persist all memory layers in a local SQLite database.
 
     Vector search is performed client-side using cosine similarity over
     JSON-serialized embedding arrays. This avoids any dependency on pgvector
@@ -269,6 +278,15 @@ class SQLiteMemoryStore(MemoryStore):
         scored = _rank_rows(rows, embedding, "prompt_embedding", threshold, limit)
         return [self._episode_from_row(row, sim) for row, sim in scored]
 
+    async def get_episode(self, episode_id: str) -> EpisodeRecord | None:
+        """Return one episodic memory record by id."""
+        cursor = await self._db.execute(
+            "SELECT * FROM am_episodic_memory WHERE episode_id = ?",
+            (episode_id,),
+        )
+        row = await cursor.fetchone()
+        return self._episode_from_row(row) if row is not None else None
+
     # ── Failure ─────────────────────────────────────────────────────
 
     async def save_failure_episode(self, failure: FailureEpisode) -> FailureEpisode:
@@ -299,16 +317,58 @@ class SQLiteMemoryStore(MemoryStore):
         """Insert a new deduplicated semantic memory fact."""
         await self._db.execute(
             "INSERT INTO am_semantic_memory (fact_id, fact_type, content, embedding, confidence_score, "
-            "source, source_episode_id, created_at, last_reinforced_at, last_confirmed_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "source, source_episode_id, pinned, created_at, last_reinforced_at, last_confirmed_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (record.fact_id, record.fact_type.value, record.content,
              json.dumps(record.embedding) if record.embedding else None,
              record.confidence_score, record.source, record.source_episode_id,
+             1 if record.pinned else 0,
              record.created_at.isoformat(), record.last_reinforced_at.isoformat(),
              record.last_confirmed_at.isoformat()),
         )
         await self._db.commit()
         return record
+
+    async def delete_semantic(self, fact_id: str) -> bool:
+        """Delete one semantic memory fact."""
+        cursor = await self._db.execute(
+            "DELETE FROM am_semantic_memory WHERE fact_id = ?",
+            (fact_id,),
+        )
+        await self._db.commit()
+        return bool(cursor.rowcount)
+
+    async def update_semantic_metadata(
+        self,
+        fact_id: str,
+        *,
+        confidence_score: float | None = None,
+        pinned: bool | None = None,
+        last_confirmed_at: datetime | None = None,
+    ) -> bool:
+        """Update management metadata for one semantic fact."""
+        updates: list[str] = []
+        params: list[object] = []
+        if confidence_score is not None:
+            updates.append("confidence_score = ?")
+            params.append(max(0.0, min(1.0, confidence_score)))
+        if pinned is not None:
+            updates.append("pinned = ?")
+            params.append(1 if pinned else 0)
+        if last_confirmed_at is not None:
+            updates.append("last_confirmed_at = ?")
+            params.append(last_confirmed_at.isoformat())
+        if not updates:
+            return False
+        updates.append("last_reinforced_at = ?")
+        params.append(utc_now().isoformat())
+        params.append(fact_id)
+        cursor = await self._db.execute(
+            f"UPDATE am_semantic_memory SET {', '.join(updates)} WHERE fact_id = ?",  # noqa: S608
+            params,
+        )
+        await self._db.commit()
+        return bool(cursor.rowcount)
 
     async def reinforce_semantic(
         self, fact_id: str, confidence_score: float | None = None, source: str | None = None
@@ -340,7 +400,7 @@ class SQLiteMemoryStore(MemoryStore):
         """Replace an existing semantic fact after conflict resolution."""
         await self._db.execute(
             "UPDATE am_semantic_memory SET fact_type = ?, content = ?, embedding = ?, confidence_score = ?, source = ?, "
-            "source_episode_id = ?, last_reinforced_at = ?, last_confirmed_at = ? WHERE fact_id = ?",
+            "source_episode_id = ?, pinned = ?, last_reinforced_at = ?, last_confirmed_at = ? WHERE fact_id = ?",
             (
                 record.fact_type.value,
                 record.content,
@@ -348,6 +408,7 @@ class SQLiteMemoryStore(MemoryStore):
                 record.confidence_score,
                 record.source,
                 record.source_episode_id,
+                1 if record.pinned else 0,
                 record.last_reinforced_at.isoformat(),
                 record.last_confirmed_at.isoformat(),
                 fact_id,
@@ -369,7 +430,7 @@ class SQLiteMemoryStore(MemoryStore):
         sql = "SELECT * FROM am_semantic_memory WHERE confidence_score >= ?"
         params: list[object] = [min_confidence]
         if last_confirmed_after is not None:
-            sql += " AND last_confirmed_at >= ?"
+            sql += " AND (last_confirmed_at >= ? OR pinned = 1)"
             params.append(last_confirmed_after.isoformat())
         cursor = await self._db.execute(sql, params)
         rows = await cursor.fetchall()
@@ -486,6 +547,58 @@ class SQLiteMemoryStore(MemoryStore):
         row = await cursor.fetchone()
         return int(row[0]) if row is not None else 0
 
+    async def prune_episodes_before(self, cutoff: datetime) -> int:
+        """Delete episodic memories older than a cutoff and detach related failures."""
+        cutoff_text = cutoff.isoformat()
+        await self._db.execute(
+            "UPDATE am_failure_episodes SET episode_id = NULL WHERE episode_id IN "
+            "(SELECT episode_id FROM am_episodic_memory WHERE timestamp < ?)",
+            (cutoff_text,),
+        )
+        cursor = await self._db.execute(
+            "DELETE FROM am_episodic_memory WHERE timestamp < ?",
+            (cutoff_text,),
+        )
+        await self._db.commit()
+        return cursor.rowcount or 0
+
+    async def get_retrieval_weights(self, session_id: str) -> dict[str, float] | None:
+        """Return persisted planner feedback weights for a session."""
+        cursor = await self._db.execute(
+            "SELECT semantic_weight, procedural_weight, episodic_weight FROM am_retrieval_feedback "
+            "WHERE session_id = ?",
+            (session_id,),
+        )
+        row = await cursor.fetchone()
+        if row is None:
+            return None
+        return {
+            "semantic": float(row["semantic_weight"]),
+            "procedural": float(row["procedural_weight"]),
+            "episodic": float(row["episodic_weight"]),
+        }
+
+    async def save_retrieval_weights(self, session_id: str, weights: dict[str, float]) -> None:
+        """Persist planner feedback weights for a session."""
+        await self._db.execute(
+            "INSERT INTO am_retrieval_feedback "
+            "(session_id, semantic_weight, procedural_weight, episodic_weight, updated_at) "
+            "VALUES (?, ?, ?, ?, ?) "
+            "ON CONFLICT(session_id) DO UPDATE SET "
+            "semantic_weight = excluded.semantic_weight, "
+            "procedural_weight = excluded.procedural_weight, "
+            "episodic_weight = excluded.episodic_weight, "
+            "updated_at = excluded.updated_at",
+            (
+                session_id,
+                _clamp_weight(weights.get("semantic")),
+                _clamp_weight(weights.get("procedural")),
+                _clamp_weight(weights.get("episodic")),
+                utc_now().isoformat(),
+            ),
+        )
+        await self._db.commit()
+
     # ── Row Parsers ─────────────────────────────────────────────────
 
     def _conv_from_row(self, row: Any) -> ConversationalTurnRecord:
@@ -558,6 +671,7 @@ class SQLiteMemoryStore(MemoryStore):
             confidence_score=float(row["confidence_score"]),
             source=str(row["source"] or "llm_inferred"),
             source_episode_id=cast(str | None, row["source_episode_id"]),
+            pinned=bool(row["pinned"]),
             created_at=row["created_at"] or utc_now(),
             last_reinforced_at=row["last_reinforced_at"] or utc_now(),
             last_confirmed_at=row["last_confirmed_at"] or row["last_reinforced_at"] or utc_now(),
@@ -606,6 +720,17 @@ async def _migrate_schema(db: aiosqlite.Connection) -> None:
             "UPDATE am_semantic_memory SET last_confirmed_at = COALESCE(last_reinforced_at, created_at, datetime('now')) "
             "WHERE last_confirmed_at IS NULL"
         )
+    if "pinned" not in columns:
+        await db.execute("ALTER TABLE am_semantic_memory ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0")
+
+    await db.execute(
+        "CREATE TABLE IF NOT EXISTS am_retrieval_feedback ("
+        "session_id TEXT PRIMARY KEY, "
+        "semantic_weight REAL NOT NULL DEFAULT 1.0, "
+        "procedural_weight REAL NOT NULL DEFAULT 1.0, "
+        "episodic_weight REAL NOT NULL DEFAULT 1.0, "
+        "updated_at TEXT NOT NULL)"
+    )
 
 
 def _stronger_source(current: str, candidate: str | None) -> str:
@@ -647,3 +772,9 @@ def _cosine(left: list[float], right: list[float]) -> float:
         return 0.0
     val = dot / (left_norm * right_norm)
     return max(0.0, min(1.0, val))
+
+
+def _clamp_weight(value: object) -> float:
+    """Clamp persisted planner feedback weights to the supported range."""
+    parsed = float(value) if isinstance(value, (int, float, str)) else 1.0
+    return max(0.5, min(1.5, parsed))

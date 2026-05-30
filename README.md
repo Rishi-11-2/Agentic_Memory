@@ -233,6 +233,13 @@ This exposes an additional MCP tool `run_autonomous_turn(user_message, session_i
 | `get_conversation_history` | `session_id`, `last_n?` | Fetch recent conversation messages |
 | `clear_session_memory` | `session_id` | Clear a session's conversation history |
 | `inspect_memory_layers` | `limit?` | View memory layer counts and recent records |
+| `delete_semantic_fact` | `fact_id` | Delete one semantic fact |
+| `pin_semantic_fact` | `fact_id`, `pinned?` | Pin/unpin a fact so TTL filtering does not hide it |
+| `mark_semantic_fact_stale` | `fact_id`, `stale_days?` | Move a fact's confirmation timestamp into the past |
+| `inspect_episode` | `episode_id` | Fetch one full episodic record |
+| `prune_old_episodes` | `older_than_days?` | Delete old episodic records while preserving detached failures |
+| `export_memory` | `layers?`, `limit_per_layer?` | Export recent memory records as JSON |
+| `import_memory` | `memory_json`, `import_semantic?` | Import semantic facts from an export payload |
 | `run_autonomous_turn` | `user_message`, `session_id` | *(Standalone only)* Run a full Actor-Critic loop |
 
 ### `consolidate_turn` Parameters
@@ -281,6 +288,18 @@ This exposes an additional MCP tool `run_autonomous_turn(user_message, session_i
 │  Sentence Transformers / hash fallback   │
 └──────────────────────────────────────────┘
 ```
+
+For contributor-facing architecture notes, see [`docs/architecture.md`](docs/architecture.md).
+
+## Evaluation Harness
+
+Run the offline harness with SQLite and hash embeddings:
+
+```bash
+python -m tests.evaluation_harness
+```
+
+It checks preference/fact extraction, semantic deduplication, pin/stale management, persisted planner feedback, context rendering, and failure recall.
 
 ---
 
@@ -333,6 +352,7 @@ docker compose --profile postgres up
 ├── main.py                    # Secondary REST API (admin/debug)
 ├── config.py                  # Settings and structured logging
 ├── core/
+│   ├── evaluation_service.py  # Shared auto-evaluation service
 │   ├── memory_service.py      # Context assembly + memory consolidation
 │   └── models.py              # Pydantic schemas for all memory layers
 ├── store/
@@ -355,6 +375,10 @@ docker compose --profile postgres up
 ├── schema.sql                 # PostgreSQL schema with pgvector
 ├── demo/
 │   └── demo_main.py           # 3-turn demo (offline or LLM-powered)
+├── docs/
+│   └── architecture.md        # Contributor-facing architecture notes
+├── tests/
+│   └── evaluation_harness.py  # Offline behavioral harness
 ├── .env.example               # All configuration options
 └── .mcp.json                  # Example MCP server configuration
 ```

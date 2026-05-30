@@ -73,6 +73,10 @@ class MemoryStore(Protocol):
         """Persist an append-only episodic memory record."""
         ...
 
+    async def get_episode(self, episode_id: str) -> EpisodeRecord | None:
+        """Return one episodic memory record by id."""
+        ...
+
     async def search_episodes(
         self, embedding: list[float], limit: int, threshold: float
     ) -> list[EpisodeRecord]:
@@ -91,6 +95,21 @@ class MemoryStore(Protocol):
 
     async def insert_semantic(self, record: SemanticMemoryRecord) -> SemanticMemoryRecord:
         """Insert a new deduplicated semantic memory fact."""
+        ...
+
+    async def delete_semantic(self, fact_id: str) -> bool:
+        """Delete one semantic memory fact."""
+        ...
+
+    async def update_semantic_metadata(
+        self,
+        fact_id: str,
+        *,
+        confidence_score: float | None = None,
+        pinned: bool | None = None,
+        last_confirmed_at: datetime | None = None,
+    ) -> bool:
+        """Update management metadata for one semantic fact."""
         ...
 
     async def reinforce_semantic(
@@ -136,4 +155,16 @@ class MemoryStore(Protocol):
 
     async def count_layer(self, layer: MemoryLayer) -> int:
         """Return the number of records in one memory layer."""
+        ...
+
+    async def prune_episodes_before(self, cutoff: datetime) -> int:
+        """Delete episodic memories older than a cutoff and detach related failures."""
+        ...
+
+    async def get_retrieval_weights(self, session_id: str) -> dict[str, float] | None:
+        """Return persisted planner feedback weights for a session."""
+        ...
+
+    async def save_retrieval_weights(self, session_id: str, weights: dict[str, float]) -> None:
+        """Persist planner feedback weights for a session."""
         ...

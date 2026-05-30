@@ -163,6 +163,7 @@ class SemanticMemoryRecord(BaseModel):
     confidence_score: float = Field(ge=0.0, le=1.0)
     source: str = "llm_inferred"
     source_episode_id: str | None = None
+    pinned: bool = False
     created_at: datetime = Field(default_factory=utc_now)
     last_reinforced_at: datetime = Field(default_factory=utc_now)
     last_confirmed_at: datetime = Field(default_factory=utc_now)
