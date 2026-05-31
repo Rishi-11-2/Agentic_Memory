@@ -62,9 +62,13 @@ consolidate_turn(
 ```bash
 git clone https://github.com/Rishi-11-2/Agentic_Memory.git
 cd Agentic_Memory
-python -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
+python3.13 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
 ```
+
+Use Python 3.13 for the virtual environment. Python 3.14 can fail while building older native dependencies such as `pydantic-core`.
 
 ### Claude Code (Zero Config)
 
@@ -74,13 +78,14 @@ Add to your project's `.mcp.json`:
 {
   "mcpServers": {
     "agentic-memory": {
-      "command": "python",
-      "args": ["mcp_server.py"],
+      "command": "/absolute/path/to/Agentic_Memory/.venv/bin/python",
+      "args": ["/absolute/path/to/Agentic_Memory/mcp_server.py"],
       "cwd": "/absolute/path/to/Agentic_Memory",
       "env": {
         "MEMORY_BACKEND": "sqlite",
         "SQLITE_DB_PATH": "memory.db",
-        "EMBEDDING_BACKEND": "hash"
+        "EMBEDDING_BACKEND": "hash",
+        "LLM_PROVIDER": "deterministic"
       }
     }
   }
@@ -102,13 +107,14 @@ That's it. No API keys needed — the enhanced heuristic Critic automatically ex
 {
   "mcpServers": {
     "agentic-memory": {
-      "command": "python",
-      "args": ["mcp_server.py"],
+      "command": "/absolute/path/to/Agentic_Memory/.venv/bin/python",
+      "args": ["/absolute/path/to/Agentic_Memory/mcp_server.py"],
       "cwd": "/absolute/path/to/Agentic_Memory",
       "env": {
         "MEMORY_BACKEND": "sqlite",
         "SQLITE_DB_PATH": "memory.db",
-        "EMBEDDING_BACKEND": "hash"
+        "EMBEDDING_BACKEND": "hash",
+        "LLM_PROVIDER": "deterministic"
       },
       "disabled": false,
       "autoApprove": []
@@ -121,7 +127,7 @@ That's it. No API keys needed — the enhanced heuristic Critic automatically ex
 
 First start the server:
 ```bash
-MCP_TRANSPORT=http MCP_HTTP_PORT=8001 python mcp_server.py
+MCP_TRANSPORT=http MCP_HTTP_PORT=8001 .venv/bin/python mcp_server.py
 ```
 
 Then in `cline_mcp_settings.json`:
@@ -154,20 +160,22 @@ codex mcp add agentic-memory \
   --env MEMORY_BACKEND=sqlite \
   --env SQLITE_DB_PATH=memory.db \
   --env EMBEDDING_BACKEND=hash \
-  -- python /absolute/path/to/Agentic_Memory/mcp_server.py
+  --env LLM_PROVIDER=deterministic \
+  -- /absolute/path/to/Agentic_Memory/.venv/bin/python /absolute/path/to/Agentic_Memory/mcp_server.py
 ```
 
 **Option B — Edit `~/.codex/config.toml` directly:**
 
 ```toml
 [mcp_servers.agentic-memory]
-command = "python"
+command = "/absolute/path/to/Agentic_Memory/.venv/bin/python"
 args = ["/absolute/path/to/Agentic_Memory/mcp_server.py"]
 
 [mcp_servers.agentic-memory.env]
 MEMORY_BACKEND = "sqlite"
 SQLITE_DB_PATH = "memory.db"
 EMBEDDING_BACKEND = "hash"
+LLM_PROVIDER = "deterministic"
 ```
 
 For project-scoped config, create `.codex/config.toml` in your project root instead.
@@ -194,7 +202,7 @@ The AI agent IS the Actor. The system uses enhanced heuristic evaluation:
 
 ```bash
 # Zero config — works immediately
-python mcp_server.py
+.venv/bin/python mcp_server.py
 ```
 
 ### 2. MCP Mode + LLM Critic (One API Key)
@@ -203,9 +211,9 @@ Add an LLM provider for deeper auto-evaluation. The Critic LLM scores responses 
 
 ```bash
 # Any one of:
-LLM_PROVIDER=anthropic ANTHROPIC_API_KEY=sk-ant-... python mcp_server.py
-LLM_PROVIDER=openai   OPENAI_API_KEY=sk-...       python mcp_server.py
-LLM_PROVIDER=groq     GROQ_API_KEY=gsk_...        python mcp_server.py
+LLM_PROVIDER=anthropic ANTHROPIC_API_KEY=sk-ant-... .venv/bin/python mcp_server.py
+LLM_PROVIDER=openai   OPENAI_API_KEY=sk-...       .venv/bin/python mcp_server.py
+LLM_PROVIDER=groq     GROQ_API_KEY=gsk_...        .venv/bin/python mcp_server.py
 ```
 
 ### 3. Standalone Mode (One API Key + Flag)
@@ -216,7 +224,7 @@ The system acts as BOTH Actor and Critic — it generates responses using its ow
 LLM_PROVIDER=anthropic \
 ANTHROPIC_API_KEY=sk-ant-... \
 STANDALONE_LOOP_ENABLED=true \
-python mcp_server.py
+.venv/bin/python mcp_server.py
 ```
 
 This exposes an additional MCP tool `run_autonomous_turn(user_message, session_id)` that runs the full 6-phase self-learning loop.
