@@ -38,11 +38,40 @@ Standalone mode is optional and requires an LLM provider. In this mode the proje
 
 The quick-path planner combines keyword triggers with vector search and adaptive per-session weights. Feedback weights are persisted through the store contract, so retrieval tuning survives process restarts. Retrieved records are re-ranked before context rendering using similarity, recency, confidence, outcome quality, workflow maturity, hierarchy-node abstraction level, and pinning.
 
-Semantic hierarchy records are deterministic aggregates derived from flat
-semantic facts. Each saved or reinforced semantic fact updates a root index,
-facet node, facet summary, and Q&A-style node. This gives retrieval a
-hierarchical semantic layer without requiring asynchronous batch jobs or an
-internal planner LLM.
+## Semantic Hierarchy
+
+Semantic hierarchy is a derived layer built from flat semantic facts. It gives
+retrieval a higher-level view of preferences and project context without
+requiring a hidden internal planner LLM or an asynchronous batch pipeline.
+
+The hierarchy is stored in `am_semantic_hierarchy_nodes` and represented by
+`SemanticHierarchyNode`. Nodes have deterministic keys, parent links, a facet,
+source fact IDs, embeddings, confidence, and timestamps.
+
+| Node type | Purpose | Key shape |
+|---|---|---|
+| `root` | Top-level semantic index. | `root` |
+| `facet` | Groups related facts into stable facets such as `communication_preferences`, `workflow_preferences`, `project_context`, `environment`, and `general_knowledge`. | `facet:{facet}` |
+| `summary` | Compact bottom-up summary for the facet. | `summary:{facet}` |
+| `qa` | Q&A-style retrieval node whose answer is grounded in one or more semantic facts. | `qa:{facet}:{question_hash}` |
+
+Build flow:
+
+```text
+semantic fact
+  -> classify facet
+  -> upsert root node
+  -> upsert facet node
+  -> merge fact into facet summary
+  -> merge fact into facet Q&A node
+```
+
+This means the canonical semantic record remains the flat fact. The hierarchy
+does not own truth; it is a retrieval index over active semantic records. The
+quick-path planner searches semantic hierarchy nodes when semantic memory is
+triggered, and `retrieve_memory_layer(..., layer="semantic_hierarchy")` lets
+Codex, Claude Code, or another MCP client explicitly use it during external
+agentic retrieval orchestration.
 
 ## Memory Governance
 
@@ -55,7 +84,7 @@ content is not retained.
 
 ## Testing
 
-The offline evaluation harness lives at `tests/evaluation_harness.py` and uses SQLite plus hash embeddings. It covers heuristic evaluation, semantic deduplication, pin/stale behavior, persisted planner feedback, context rendering, and failure recall.
+The offline evaluation harness lives at `tests/evaluation_harness.py` and uses SQLite plus hash embeddings. It covers heuristic evaluation, semantic deduplication, semantic hierarchy creation and retrieval, pin/stale behavior, persisted planner feedback, context rendering, and failure recall.
 
 Run it with:
 

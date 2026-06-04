@@ -11,8 +11,8 @@ stronger Critic or enable standalone Actor-Critic mode.
 
 ## What It Provides
 
-- Multi-layer long-term memory for conversations, episodes, facts, workflows,
-  and failures.
+- Multi-layer long-term memory for conversations, episodes, facts, semantic
+  hierarchy summaries, workflows, and failures.
 - Two-tool MCP workflow: retrieve context before answering, consolidate after
   answering.
 - Optional external-orchestrator workflow where Codex, Claude Code, or another
@@ -362,8 +362,9 @@ Run the behavioral harness:
 python -m tests.evaluation_harness
 ```
 
-The harness covers heuristic evaluation, semantic deduplication, pin/stale
-behavior, persisted planner feedback, context rendering, and failure recall.
+The harness covers heuristic evaluation, semantic deduplication, semantic
+hierarchy creation and retrieval, pin/stale behavior, persisted planner
+feedback, context rendering, and failure recall.
 
 ## Project Structure
 
