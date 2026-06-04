@@ -1,63 +1,72 @@
 # Agentic Memory
 
-Persistent, self-learning memory for AI coding agents. Ships as an **MCP server** for [Claude Code](https://docs.anthropic.com/en/docs/claude-code), [Cline](https://github.com/cline/cline), [Codex](https://openai.com/index/codex/), and other MCP-compatible assistants.
+Persistent, self-learning memory for AI coding agents. Agentic Memory runs as an
+MCP server for Claude Code, Cline, Codex, and other MCP-compatible assistants.
 
-**No LLM API keys required.** The AI agent (Claude, Codex, etc.) IS the Actor — it reasons, picks tools, and generates responses. The memory system learns from every interaction using enhanced heuristics. Optionally add an LLM provider for deeper auto-evaluation or standalone mode.
+The default mode needs no LLM API key. Your assistant remains the Actor: it
+reasons, calls tools, and writes the user-facing response. Agentic Memory stores
+the turn, evaluates it with deterministic heuristics, and consolidates useful
+signals into long-term memory. You can optionally add an LLM provider for a
+stronger Critic or enable standalone Actor-Critic mode.
 
----
+## What It Provides
 
-## What It Does
+- Multi-layer long-term memory for conversations, episodes, facts, workflows,
+  and failures.
+- Two-tool MCP workflow: retrieve context before answering, consolidate after
+  answering.
+- Deterministic zero-key mode for local use.
+- Optional Anthropic, OpenAI, or Groq Critic for deeper evaluation.
+- SQLite by default, with PostgreSQL/pgvector support for larger deployments.
+- Hash embeddings for fast zero-dependency startup, or sentence-transformer
+  embeddings for higher-quality retrieval.
+- Semantic fact governance: delete, pin, stale, export, and import memories.
 
-Agentic Memory gives AI agents **long-term memory that learns**. Every interaction is stored, evaluated, and consolidated into five specialized memory layers:
+## Memory Loop
 
-| Layer | What It Stores | Example |
-|---|---|---|
-| **Conversational** | Sliding window of recent messages | Current chat context |
-| **Episodic** | Complete turn records with outcomes | "Last time I ran tests, 3 failed on auth" |
-| **Semantic** | Durable facts, preferences, rules | "User prefers TypeScript over JavaScript" |
-| **Procedural** | Learned multi-step tool workflows | "Deploy = build → test → push → deploy" |
-| **Failure** | Past tool failures for avoidance | "pip install failed — use pip3 instead" |
+Agents use Agentic Memory with two calls:
 
----
+```text
+1. get_session_context(user_message, session_id)
+   Returns relevant system rules, preferences, facts, workflows, recent
+   conversation, similar episodes, and past failures.
 
-## How Agents Use It
+2. The agent answers the user.
 
-The agent calls **two MCP tools** — the self-learning loop runs automatically inside `consolidate_turn`:
-
-```
-1. get_session_context(message, session_id)
-   → Returns relevant memories as context
-
-2. Agent generates its response using the memory context
-
-3. consolidate_turn(session_id, message, response, ...)
-   → Auto-evaluates quality (enhanced heuristics or LLM Critic)
-   → Extracts preferences and facts from user messages
-   → Learns reusable tool workflows
-   → Records failures for future avoidance
-```
-
-No special prompting needed. The tools are self-describing — Claude Code, Cline, and Codex will discover and use them automatically.
-
-### Agent Self-Score
-
-The agent can optionally rate its own response quality via `quality_score` (0–10). This gives the system a much richer learning signal than heuristics alone:
-
-```json
-consolidate_turn(
-  session_id="session-1",
-  user_message="Fix the auth bug",
-  assistant_response="I found and fixed the issue in auth.py...",
-  quality_score=8.5,
-  reasoning_summary="Found root cause in token validation, applied fix and verified tests pass"
-)
+3. consolidate_turn(session_id, user_message, assistant_response, ...)
+   Saves the turn, evaluates quality, extracts durable facts, learns successful
+   workflows, records failures, and tunes retrieval weights.
 ```
 
----
+The system does not move one memory record from one layer into another. It
+derives higher-level records from a completed turn, keeps the source episode,
+and links derived records back to that episode where useful.
 
-## Quick Start
+## Memory Layers
 
-### Install
+| Layer | Stores | Created From | Notes |
+|---|---|---|---|
+| Conversational | Recent user and assistant messages | Every `consolidate_turn` call | Kept as a sliding window; older turns can be rolled into summaries. |
+| Episodic | Full completed turns with prompt, response, tools, outcome, latency, and errors | Every completed turn | Append-only audit trail used for similar-past-episode recall. |
+| Semantic | Durable preferences, environment facts, and system rules | Critic/heuristic fact extraction and `new_facts` | Deduplicated by embedding similarity; conflicts are resolved by source, confidence, and recency. |
+| Procedural | Reusable multi-step tool workflows | Successful turns with at least two successful tool calls | Upserted by workflow signature and promoted by repeated success. |
+| Failure | Tool failures worth avoiding later | Critic-flagged failed tool calls | Linked to the source episode; preserved when old episodes are pruned. |
+
+Typical derivation:
+
+```text
+completed turn
+  -> conversational messages
+  -> episodic record
+  -> semantic facts, if durable facts/preferences/rules are found
+  -> procedural workflow, if a successful repeatable tool chain is found
+  -> failure record, if a tool failure should be remembered
+```
+
+## Install
+
+Use Python 3.13 for the virtual environment. Python 3.14 can fail while
+building older native dependencies such as `pydantic-core`.
 
 ```bash
 git clone https://github.com/Rishi-11-2/Agentic_Memory.git
@@ -68,11 +77,22 @@ python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 ```
 
-Use Python 3.13 for the virtual environment. Python 3.14 can fail while building older native dependencies such as `pydantic-core`.
+For the fastest local setup, use hash embeddings:
 
-### Claude Code (Zero Config)
+```bash
+export MEMORY_BACKEND=sqlite
+export SQLITE_DB_PATH=agentic_memory.db
+export EMBEDDING_BACKEND=hash
+export LLM_PROVIDER=deterministic
+```
 
-Add to your project's `.mcp.json`:
+## MCP Client Setup
+
+Replace `/absolute/path/to/Agentic_Memory` with your local checkout path.
+
+### Claude Code
+
+Add this to your project's `.mcp.json`:
 
 ```json
 {
@@ -83,7 +103,7 @@ Add to your project's `.mcp.json`:
       "cwd": "/absolute/path/to/Agentic_Memory",
       "env": {
         "MEMORY_BACKEND": "sqlite",
-        "SQLITE_DB_PATH": "memory.db",
+        "SQLITE_DB_PATH": "agentic_memory.db",
         "EMBEDDING_BACKEND": "hash",
         "LLM_PROVIDER": "deterministic"
       }
@@ -92,16 +112,40 @@ Add to your project's `.mcp.json`:
 }
 ```
 
-That's it. No API keys needed — the enhanced heuristic Critic automatically extracts preferences, learns facts, scores quality, and saves workflows.
+### Codex
 
-### Cline (VS Code)
+```bash
+codex mcp add agentic-memory \
+  --env MEMORY_BACKEND=sqlite \
+  --env SQLITE_DB_PATH=agentic_memory.db \
+  --env EMBEDDING_BACKEND=hash \
+  --env LLM_PROVIDER=deterministic \
+  -- /absolute/path/to/Agentic_Memory/.venv/bin/python /absolute/path/to/Agentic_Memory/mcp_server.py
+```
 
-1. Open VS Code → Cline panel → click the **MCP Servers** icon → **Configure** tab → **Configure MCP Servers**.  
-   This opens `cline_mcp_settings.json`.
+Verify registration:
 
-2. Add the agentic-memory server:
+```bash
+codex mcp
+```
 
-**Option A — stdio (recommended, runs locally):**
+You can also edit `~/.codex/config.toml` directly:
+
+```toml
+[mcp_servers.agentic-memory]
+command = "/absolute/path/to/Agentic_Memory/.venv/bin/python"
+args = ["/absolute/path/to/Agentic_Memory/mcp_server.py"]
+
+[mcp_servers.agentic-memory.env]
+MEMORY_BACKEND = "sqlite"
+SQLITE_DB_PATH = "agentic_memory.db"
+EMBEDDING_BACKEND = "hash"
+LLM_PROVIDER = "deterministic"
+```
+
+### Cline
+
+Open the Cline MCP settings file and add the stdio server:
 
 ```json
 {
@@ -112,7 +156,7 @@ That's it. No API keys needed — the enhanced heuristic Critic automatically ex
       "cwd": "/absolute/path/to/Agentic_Memory",
       "env": {
         "MEMORY_BACKEND": "sqlite",
-        "SQLITE_DB_PATH": "memory.db",
+        "SQLITE_DB_PATH": "agentic_memory.db",
         "EMBEDDING_BACKEND": "hash",
         "LLM_PROVIDER": "deterministic"
       },
@@ -123,102 +167,51 @@ That's it. No API keys needed — the enhanced heuristic Critic automatically ex
 }
 ```
 
-**Option B — HTTP/SSE (connect to a running server):**
+To skip approval prompts for the common memory calls:
 
-First start the server:
+```json
+"autoApprove": ["get_session_context", "consolidate_turn", "search_memory"]
+```
+
+For clients that need HTTP/SSE, start the MCP server with HTTP transport:
+
 ```bash
 MCP_TRANSPORT=http MCP_HTTP_PORT=8001 .venv/bin/python mcp_server.py
 ```
 
-Then in `cline_mcp_settings.json`:
-```json
-{
-  "mcpServers": {
-    "agentic-memory": {
-      "url": "http://localhost:8001/sse",
-      "disabled": false,
-      "autoApprove": []
-    }
-  }
-}
+Then configure the client URL as:
+
+```text
+http://localhost:8001/sse
 ```
-
-3. Save the file and restart Cline (click **Restart** in the MCP Servers panel).  
-   The memory tools will appear in Cline's tool list.
-
-> **Tip:** To auto-approve memory tools without confirmation prompts, add their names to the `autoApprove` array:
-> ```json
-> "autoApprove": ["get_session_context", "consolidate_turn", "search_memory"]
-> ```
-
-### Codex
-
-**Option A — CLI command:**
-
-```bash
-codex mcp add agentic-memory \
-  --env MEMORY_BACKEND=sqlite \
-  --env SQLITE_DB_PATH=memory.db \
-  --env EMBEDDING_BACKEND=hash \
-  --env LLM_PROVIDER=deterministic \
-  -- /absolute/path/to/Agentic_Memory/.venv/bin/python /absolute/path/to/Agentic_Memory/mcp_server.py
-```
-
-**Option B — Edit `~/.codex/config.toml` directly:**
-
-```toml
-[mcp_servers.agentic-memory]
-command = "/absolute/path/to/Agentic_Memory/.venv/bin/python"
-args = ["/absolute/path/to/Agentic_Memory/mcp_server.py"]
-
-[mcp_servers.agentic-memory.env]
-MEMORY_BACKEND = "sqlite"
-SQLITE_DB_PATH = "memory.db"
-EMBEDDING_BACKEND = "hash"
-LLM_PROVIDER = "deterministic"
-```
-
-For project-scoped config, create `.codex/config.toml` in your project root instead.
-
-Verify the server is registered:
-
-```bash
-codex mcp
-```
-
----
 
 ## Operating Modes
 
-### 1. MCP Mode (Default — No API Key)
+### MCP Mode, Zero Key
 
-The AI agent IS the Actor. The system uses enhanced heuristic evaluation:
-
-- **Preference detection** — Automatically extracts "I prefer...", "always use...", "never do..." patterns
-- **Fact extraction** — Learns about your environment ("I use Python 3.12", "our stack runs on AWS")
-- **Tool efficiency scoring** — Scores based on tool success/failure rates
-- **Response quality analysis** — Detects suspiciously short responses, structured content, error patterns
-- **Agent self-score** — When the agent provides `quality_score`, it's used as the primary signal
+This is the default mode. The external assistant is the Actor, and Agentic
+Memory uses deterministic evaluation for fact extraction, quality scoring,
+workflow detection, and failure recording.
 
 ```bash
-# Zero config — works immediately
 .venv/bin/python mcp_server.py
 ```
 
-### 2. MCP Mode + LLM Critic (One API Key)
+### MCP Mode With LLM Critic
 
-Add an LLM provider for deeper auto-evaluation. The Critic LLM scores responses across 5 quality dimensions and extracts semantic facts automatically:
+Set one provider to let an LLM Critic score the turn and extract richer
+semantic facts:
 
 ```bash
-# Any one of:
 LLM_PROVIDER=anthropic ANTHROPIC_API_KEY=sk-ant-... .venv/bin/python mcp_server.py
-LLM_PROVIDER=openai   OPENAI_API_KEY=sk-...       .venv/bin/python mcp_server.py
-LLM_PROVIDER=groq     GROQ_API_KEY=gsk_...        .venv/bin/python mcp_server.py
+LLM_PROVIDER=openai OPENAI_API_KEY=sk-... .venv/bin/python mcp_server.py
+LLM_PROVIDER=groq GROQ_API_KEY=gsk_... .venv/bin/python mcp_server.py
 ```
 
-### 3. Standalone Mode (One API Key + Flag)
+### Standalone Actor-Critic Mode
 
-The system acts as BOTH Actor and Critic — it generates responses using its own LLM, evaluates them, and learns. Enable with one API key and a flag:
+In standalone mode, Agentic Memory generates the response, evaluates it, and
+learns from it. This requires a real LLM provider.
 
 ```bash
 LLM_PROVIDER=anthropic \
@@ -227,171 +220,153 @@ STANDALONE_LOOP_ENABLED=true \
 .venv/bin/python mcp_server.py
 ```
 
-This exposes an additional MCP tool `run_autonomous_turn(user_message, session_id)` that runs the full 6-phase self-learning loop.
-
----
+This enables the extra MCP tool `run_autonomous_turn`.
 
 ## MCP Tools
 
-| Tool | Parameters | What It Does |
+| Tool | Parameters | Purpose |
 |---|---|---|
-| `get_session_context` | `user_message`, `session_id` | Retrieve relevant memories before responding |
-| `consolidate_turn` | `session_id`, `user_message`, `assistant_response`, `tool_calls_json?`, `new_facts?`, `failure_summary?`, `quality_score?`, `reasoning_summary?` | Save a turn and auto-learn from it |
-| `search_memory` | `query`, `layers?`, `top_k?` | Search across memory layers by similarity |
-| `get_conversation_history` | `session_id`, `last_n?` | Fetch recent conversation messages |
-| `clear_session_memory` | `session_id` | Clear a session's conversation history |
-| `inspect_memory_layers` | `limit?` | View memory layer counts and recent records |
-| `delete_semantic_fact` | `fact_id` | Delete one semantic fact |
-| `pin_semantic_fact` | `fact_id`, `pinned?` | Pin/unpin a fact so TTL filtering does not hide it |
-| `mark_semantic_fact_stale` | `fact_id`, `stale_days?` | Move a fact's confirmation timestamp into the past |
-| `inspect_episode` | `episode_id` | Fetch one full episodic record |
-| `prune_old_episodes` | `older_than_days?` | Delete old episodic records while preserving detached failures |
-| `export_memory` | `layers?`, `limit_per_layer?` | Export recent memory records as JSON |
-| `import_memory` | `memory_json`, `import_semantic?` | Import semantic facts from an export payload |
-| `run_autonomous_turn` | `user_message`, `session_id` | *(Standalone only)* Run a full Actor-Critic loop |
+| `get_session_context` | `user_message`, `session_id` | Retrieve memory-enriched context before the agent answers. |
+| `consolidate_turn` | `session_id`, `user_message`, `assistant_response`, `tool_calls_json?`, `new_facts?`, `failure_summary?`, `quality_score?`, `reasoning_summary?` | Save and learn from a completed turn. |
+| `search_memory` | `query`, `layers?`, `top_k?` | Search semantic, episodic, procedural, and failure memory by similarity. |
+| `get_conversation_history` | `session_id`, `last_n?` | Fetch recent conversation messages. |
+| `clear_session_memory` | `session_id` | Clear only the session's conversational window. |
+| `inspect_memory_layers` | `limit?` | Show counts and recent records by layer. |
+| `inspect_episode` | `episode_id` | Fetch one full episodic record. |
+| `delete_semantic_fact` | `fact_id` | Delete one semantic fact. |
+| `pin_semantic_fact` | `fact_id`, `pinned?` | Keep or unkeep a fact outside TTL filtering. |
+| `mark_semantic_fact_stale` | `fact_id`, `stale_days?` | Age a semantic fact for TTL testing or cleanup. |
+| `prune_old_episodes` | `older_than_days?` | Delete old episodic records while preserving detached failures. |
+| `export_memory` | `layers?`, `limit_per_layer?` | Export recent memory records as JSON. |
+| `import_memory` | `memory_json`, `import_semantic?` | Import semantic facts from an export payload. |
+| `run_autonomous_turn` | `user_message`, `session_id` | Run the full standalone Actor-Critic loop when enabled. |
 
-### `consolidate_turn` Parameters
+### `consolidate_turn` Details
 
-| Parameter | Required | Description |
-|---|---|---|
-| `session_id` | ✅ | Current conversation session identifier |
-| `user_message` | ✅ | The user's original message |
-| `assistant_response` | ✅ | Your response text |
-| `tool_calls_json` | ❌ | JSON array of tool calls made |
-| `new_facts` | ❌ | Facts learned from this interaction |
-| `failure_summary` | ❌ | Description of any failures encountered |
-| `quality_score` | ❌ | Agent self-assessed quality score (0–10) |
-| `reasoning_summary` | ❌ | Brief summary of the agent's reasoning approach |
+Required fields:
 
----
+| Parameter | Description |
+|---|---|
+| `session_id` | Stable conversation/session identifier. |
+| `user_message` | Original user request. |
+| `assistant_response` | Final response produced by the agent. |
 
-## Architecture
+Optional fields:
 
-```
-┌──────────────────────────────────────────┐
-│          MCP Server  (FastMCP)           │
-│                                          │
-│  get_session_context   consolidate_turn  │
-│  search_memory         clear_session     │
-│  get_conversation_history                │
-│  inspect_memory_layers                   │
-│  run_autonomous_turn (standalone only)   │
-├──────────────────────────────────────────┤
-│   Enhanced Heuristic / LLM Auto-Critic  │
-│  Preference detection · fact extraction  │
-│  Agent self-score · quality analysis     │
-├──────────────────────────────────────────┤
-│         AgenticMemoryService             │
-│  Context rendering · consolidation       │
-│  semantic dedup · conflict resolution    │
-├──────────────────────────────────────────┤
-│       HeuristicRetrievalPlanner          │
-│  Keyword + density triggers              │
-│  per-session weight tuning               │
-├──────────────────────────────────────────┤
-│    MemoryStore  (SQLite / PostgreSQL)    │
-│  5 memory tables · vector similarity     │
-├──────────────────────────────────────────┤
-│          EmbeddingModel                  │
-│  Sentence Transformers / hash fallback   │
-└──────────────────────────────────────────┘
+| Parameter | Description |
+|---|---|
+| `tool_calls_json` | JSON array of tool calls. Each item can include `tool_name`, `input_parameters`, `output_summary`, `success`, `latency_ms`, `error_trace`, and `critic_flagged`. |
+| `new_facts` | Explicit facts the agent wants to propose for semantic memory. |
+| `failure_summary` | Summary of failures encountered during the turn. |
+| `quality_score` | Agent self-score from 0 to 10; used as a strong quality signal. |
+| `reasoning_summary` | Brief approach summary stored in episodic memory. |
+
+Example:
+
+```json
+{
+  "session_id": "session-1",
+  "user_message": "Fix the auth bug",
+  "assistant_response": "I found and fixed the token validation issue.",
+  "quality_score": 8.5,
+  "reasoning_summary": "Reproduced the failure, patched token validation, and verified tests."
+}
 ```
 
-For contributor-facing architecture notes, see [`docs/architecture.md`](docs/architecture.md).
+## Configuration
 
-## Evaluation Harness
+Settings come from environment variables or `.env`. See `.env.example` for the
+full list.
 
-Run the offline harness with SQLite and hash embeddings:
+| Variable | Default | Description |
+|---|---|---|
+| `MEMORY_BACKEND` | `sqlite` | `sqlite` or `postgres`. |
+| `SQLITE_DB_PATH` | `agentic_memory.db` | SQLite database path. |
+| `POSTGRES_DSN` | `postgresql://postgres:postgres@localhost:5432/agentic_memory` | PostgreSQL connection string. |
+| `LLM_PROVIDER` | `deterministic` | `deterministic`, `groq`, `anthropic`, or `openai`. |
+| `EMBEDDING_BACKEND` | `sentence-transformer` | `sentence-transformer` or `hash`. |
+| `MCP_TRANSPORT` | `stdio` | `stdio` or `http`. |
+| `MCP_HTTP_PORT` | `8001` | HTTP/SSE port when `MCP_TRANSPORT=http`. |
+| `STANDALONE_LOOP_ENABLED` | `false` | Enables `run_autonomous_turn`; requires an LLM provider. |
+| `MEMORY_WINDOW_TURNS` | `10` | Number of recent turns kept in conversational memory. |
+| `SEMANTIC_DEDUP_THRESHOLD` | `0.92` | Similarity threshold for semantic deduplication. |
+| `SEMANTIC_MEMORY_TTL_DAYS` | `180` | Semantic freshness window; pinned facts bypass TTL filtering. |
+| `FAILURE_SIMILARITY_THRESHOLD` | `0.80` | Similarity threshold for failure recall. |
+| `TOOL_WORKSPACE_ROOT` | `.` | Workspace root for standalone runtime tools. |
+
+## Storage Backends
+
+SQLite is the default and works well for local agents:
+
+```bash
+MEMORY_BACKEND=sqlite SQLITE_DB_PATH=agentic_memory.db .venv/bin/python mcp_server.py
+```
+
+PostgreSQL uses `schema.sql` and pgvector indexes:
+
+```bash
+MEMORY_BACKEND=postgres \
+POSTGRES_DSN=postgresql://postgres:postgres@localhost:5432/agentic_memory \
+.venv/bin/python mcp_server.py
+```
+
+## REST API And Docker
+
+`main.py` exposes a small FastAPI admin/debug API alongside the MCP server.
+
+```bash
+uvicorn main:app --host 0.0.0.0 --port 7860
+```
+
+Docker Compose starts the REST API by default:
+
+```bash
+docker compose up agentic-memory
+```
+
+Start PostgreSQL with pgvector:
+
+```bash
+docker compose --profile postgres up
+```
+
+## Demo And Tests
+
+Run the offline demo with SQLite and deterministic evaluation:
+
+```bash
+python -m demo.demo_main
+```
+
+Run the behavioral harness:
 
 ```bash
 python -m tests.evaluation_harness
 ```
 
-It checks preference/fact extraction, semantic deduplication, pin/stale management, persisted planner feedback, context rendering, and failure recall.
-
----
-
-## Configuration
-
-All settings come from environment variables or a `.env` file. See [`.env.example`](.env.example) for the full list.
-
-| Variable | Default | Description |
-|---|---|---|
-| `MEMORY_BACKEND` | `sqlite` | `sqlite` or `postgres` |
-| `SQLITE_DB_PATH` | `agentic_memory.db` | SQLite database path |
-| `LLM_PROVIDER` | `deterministic` | `deterministic` (no key) / `groq` / `anthropic` / `openai` |
-| `STANDALONE_LOOP_ENABLED` | `false` | Enable full Actor-Critic standalone loop |
-| `EMBEDDING_BACKEND` | `sentence-transformer` | `sentence-transformer` (384d) or `hash` (256d, zero deps) |
-| `MCP_TRANSPORT` | `stdio` | `stdio` (Claude Code) or `http` (Codex) |
-| `MCP_HTTP_PORT` | `8001` | Port when using HTTP transport |
-| `MEMORY_WINDOW_TURNS` | `10` | Conversation sliding window size |
-| `SEMANTIC_DEDUP_THRESHOLD` | `0.92` | Cosine threshold for fact deduplication |
-
----
-
-## Demo
-
-```bash
-# Offline demo (zero config, no API key)
-python -m demo.demo_main
-
-# LLM-powered demo (one API key)
-LLM_PROVIDER=anthropic ANTHROPIC_API_KEY=sk-ant-... python -m demo.demo_main
-```
-
----
-
-## Docker
-
-```bash
-# SQLite (default)
-docker compose up agentic-memory
-
-# PostgreSQL + pgvector
-docker compose --profile postgres up
-```
-
----
+The harness covers heuristic evaluation, semantic deduplication, pin/stale
+behavior, persisted planner feedback, context rendering, and failure recall.
 
 ## Project Structure
 
-```
-├── mcp_server.py              # Primary entry point (MCP server)
-├── main.py                    # Secondary REST API (admin/debug)
-├── config.py                  # Settings and structured logging
-├── core/
-│   ├── evaluation_service.py  # Shared auto-evaluation service
-│   ├── memory_service.py      # Context assembly + memory consolidation
-│   └── models.py              # Pydantic schemas for all memory layers
-├── store/
-│   ├── base.py                # MemoryStore protocol
-│   ├── factory.py             # Backend factory (sqlite/postgres)
-│   ├── sqlite_store.py        # SQLite + client-side vector search
-│   └── postgres_store.py      # PostgreSQL + pgvector
-├── model/
-│   ├── embedding_model.py     # Sentence Transformers / hash embeddings
-│   ├── anthropic_client.py    # Anthropic structured LLM adapter
-│   ├── groq_client.py         # Groq structured LLM adapter + Protocol
-│   └── openai_client.py       # OpenAI structured LLM adapter
-├── planner/
-│   └── retrieval_planner.py   # Heuristic multi-layer query planner
-├── runtime/
-│   ├── actor.py               # Actor (standalone loop mode)
-│   ├── critic.py              # Critic (auto-evaluation)
-│   ├── self_learning_loop.py  # Full Actor-Critic loop orchestration
-│   └── tools.py               # Tool registry (calculator, web search, etc.)
-├── schema.sql                 # PostgreSQL schema with pgvector
-├── demo/
-│   └── demo_main.py           # 3-turn demo (offline or LLM-powered)
-├── docs/
-│   └── architecture.md        # Contributor-facing architecture notes
-├── tests/
-│   └── evaluation_harness.py  # Offline behavioral harness
-├── .env.example               # All configuration options
-└── .mcp.json                  # Example MCP server configuration
+```text
++-- mcp_server.py              # Primary MCP server
++-- main.py                    # FastAPI admin/debug API
++-- config.py                  # Environment settings and JSON logging
++-- core/                      # Evaluation, consolidation, and Pydantic models
++-- planner/                   # Retrieval planning and feedback weights
++-- store/                     # SQLite and PostgreSQL memory stores
++-- model/                     # Embeddings and LLM provider clients
++-- runtime/                   # Optional standalone Actor-Critic loop and tools
++-- demo/                      # Offline/LLM demo
++-- docs/architecture.md       # Contributor-facing architecture notes
++-- tests/evaluation_harness.py
++-- schema.sql                 # PostgreSQL + pgvector schema
++-- .env.example               # Full configuration reference
++-- .mcp.json                  # Example MCP client config
 ```
 
----
+For deeper implementation notes, see `docs/architecture.md`.
 
 ## License
 
