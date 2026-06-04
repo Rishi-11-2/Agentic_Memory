@@ -60,6 +60,49 @@ class MCPComponents:
 
 
 @mcp.tool()
+async def get_memory_tool_manifest() -> str:
+    """Describe memory-layer tools for an external LLM retrieval orchestrator.
+
+    Codex, Claude Code, Cline, or another MCP client can use this manifest to
+    decide which memory layers to query and in what order. This keeps the LLM
+    orchestration in the client while Agentic Memory provides durable tools.
+    """
+    return json.dumps(
+        {
+            "orchestrator": "external_mcp_client",
+            "recommended_flow": [
+                "Read the user query and decide which memory layers are relevant.",
+                "Call retrieve_memory_layer one or more times with refined queries.",
+                "Resolve conflicts by preferring explicit user-stated, high-confidence, and recent memories.",
+                "Synthesize only grounded context into the final answer.",
+                "Call consolidate_turn after answering so new signals are learned.",
+            ],
+            "layers": {
+                "conversational": "Recent session messages and rolling summaries. Use for active-thread continuity.",
+                "semantic": "Flat durable facts, preferences, and system rules. Use for precise known facts.",
+                "semantic_hierarchy": (
+                    "Aggregated semantic facets, summaries, and Q&A nodes. Use for broader preference/context questions."
+                ),
+                "episodic": "Similar completed turns with prompt, outcome, tools, and response. Use for prior examples.",
+                "procedural": "Reusable successful tool workflows. Use for multi-step implementation or analysis tasks.",
+                "failure": "Similar past tool failures. Use for cautions and known bad approaches.",
+            },
+            "tool": {
+                "name": "retrieve_memory_layer",
+                "arguments": {
+                    "query": "Natural language retrieval query.",
+                    "layer": "conversational | semantic | semantic_hierarchy | episodic | procedural | failure",
+                    "session_id": "Required for conversational lookup; optional otherwise.",
+                    "top_k": "Maximum records to return.",
+                },
+            },
+            "quick_path": "get_session_context still provides the automatic heuristic retrieval path.",
+        },
+        ensure_ascii=False,
+    )
+
+
+@mcp.tool()
 async def get_session_context(
     user_message: str,
     session_id: str,
@@ -77,6 +120,73 @@ async def get_session_context(
     plan = await components.planner.plan(user_message, session_id)
     context = await components.memory_service.build_context(plan)
     return context.rendered_context
+
+
+@mcp.tool()
+async def retrieve_memory_layer(
+    query: str,
+    layer: Literal["conversational", "semantic", "semantic_hierarchy", "episodic", "procedural", "failure"],
+    session_id: str = "",
+    top_k: int = 5,
+) -> str:
+    """Retrieve one memory layer for external LLM orchestration.
+
+    This is the granular alternative to get_session_context. An MCP client such
+    as Codex or Claude Code can call it repeatedly to build its own retrieval
+    plan across memory tools.
+    """
+    components = await _components()
+    limit = max(1, min(int(top_k), 25))
+    embedding = await components.embedding_model.embed(query)
+
+    if layer == "conversational":
+        if not session_id:
+            raise ValueError("session_id is required for conversational retrieval")
+        summaries = await components.store.recent_summaries(session_id, min(2, limit))
+        records = await components.store.recent_conversation(session_id, limit)
+        return json.dumps(
+            {
+                "layer": layer,
+                "summaries": [summary.model_dump(mode="json") for summary in summaries],
+                "records": [record.model_dump(mode="json") for record in records],
+            },
+            ensure_ascii=False,
+        )
+    if layer == "semantic":
+        records = await components.store.search_semantic(
+            embedding,
+            limit,
+            0.0,
+            0.0,
+            last_confirmed_after=components.memory_service.semantic_cutoff(),
+        )
+    elif layer == "semantic_hierarchy":
+        records = await components.store.search_semantic_hierarchy(embedding, limit, 0.0)
+    elif layer == "episodic":
+        records = await components.store.search_episodes(embedding, limit, 0.0)
+    elif layer == "procedural":
+        trigger_matches = await components.store.match_procedural_triggers(query, limit)
+        vector_matches = await components.store.search_procedural(embedding, limit, 0.0)
+        seen: set[str] = set()
+        records = []
+        for record in trigger_matches + vector_matches:
+            if record.workflow_id in seen:
+                continue
+            seen.add(record.workflow_id)
+            records.append(record)
+            if len(records) >= limit:
+                break
+    else:
+        records = await components.store.search_failures(embedding, limit, 0.0)
+
+    return json.dumps(
+        {
+            "layer": layer,
+            "query": query,
+            "records": [record.model_dump(mode="json") for record in records],
+        },
+        ensure_ascii=False,
+    )
 
 
 @mcp.tool()
@@ -166,7 +276,7 @@ async def consolidate_turn(
 @mcp.tool()
 async def search_memory(
     query: str,
-    layers: list[Literal["semantic", "episodic", "procedural", "failure"]] | None = None,
+    layers: list[Literal["semantic", "semantic_hierarchy", "episodic", "procedural", "failure"]] | None = None,
     top_k: int = 5,
 ) -> str:
     """Search memory layers for records relevant to a query.
@@ -175,7 +285,7 @@ async def search_memory(
     relevant past experiences, learned facts, known workflows, or past failures.
     """
     components = await _components()
-    selected = layers or ["semantic", "episodic", "procedural", "failure"]
+    selected = layers or ["semantic", "semantic_hierarchy", "episodic", "procedural", "failure"]
     embedding = await components.embedding_model.embed(query)
     result: dict[str, Any] = {}
     if "semantic" in selected:
@@ -187,6 +297,9 @@ async def search_memory(
             last_confirmed_after=components.memory_service.semantic_cutoff(),
         )
         result["semantic"] = [record.model_dump(mode="json") for record in semantic_records]
+    if "semantic_hierarchy" in selected:
+        hierarchy_records = await components.store.search_semantic_hierarchy(embedding, top_k, 0.0)
+        result["semantic_hierarchy"] = [record.model_dump(mode="json") for record in hierarchy_records]
     if "episodic" in selected:
         episodic_records = await components.store.search_episodes(embedding, top_k, 0.0)
         result["episodic"] = [record.model_dump(mode="json") for record in episodic_records]
@@ -237,16 +350,24 @@ async def inspect_memory_layers(
     components = await _components()
     counts = {
         layer.value: await components.store.count_layer(layer)
-        for layer in (MemoryLayer.CONVERSATIONAL, MemoryLayer.EPISODIC, MemoryLayer.SEMANTIC, MemoryLayer.PROCEDURAL)
+        for layer in (
+            MemoryLayer.CONVERSATIONAL,
+            MemoryLayer.EPISODIC,
+            MemoryLayer.SEMANTIC,
+            MemoryLayer.SEMANTIC_HIERARCHY,
+            MemoryLayer.PROCEDURAL,
+        )
     }
     counts["failure"] = await components.store.count_layer(MemoryLayer.FAILURE)
     semantic = await components.store.inspect_layer(MemoryLayer.SEMANTIC, 3, 0)
+    hierarchy = await components.store.inspect_layer(MemoryLayer.SEMANTIC_HIERARCHY, 6, 0)
     episodes = await components.store.inspect_layer(MemoryLayer.EPISODIC, 3, 0)
     workflows = await components.store.inspect_layer(MemoryLayer.PROCEDURAL, limit, 0)
     return json.dumps(
         {
             "counts": counts,
             "recent_semantic_facts": semantic,
+            "recent_semantic_hierarchy": hierarchy,
             "recent_episodes": episodes,
             "active_procedural_workflows": workflows,
         },
@@ -260,7 +381,11 @@ async def delete_semantic_fact(fact_id: str) -> str:
     """Delete one semantic fact by id."""
     components = await _components()
     deleted = await components.store.delete_semantic(fact_id)
-    return json.dumps({"deleted": deleted, "fact_id": fact_id}, ensure_ascii=False)
+    hierarchy_nodes = await components.memory_service.rebuild_semantic_hierarchy() if deleted else 0
+    return json.dumps(
+        {"deleted": deleted, "fact_id": fact_id, "rebuilt_semantic_hierarchy_nodes": hierarchy_nodes},
+        ensure_ascii=False,
+    )
 
 
 @mcp.tool()
@@ -268,7 +393,16 @@ async def pin_semantic_fact(fact_id: str, pinned: bool = True) -> str:
     """Pin or unpin a semantic fact so TTL filtering does not hide it."""
     components = await _components()
     updated = await components.store.update_semantic_metadata(fact_id, pinned=pinned)
-    return json.dumps({"updated": updated, "fact_id": fact_id, "pinned": pinned}, ensure_ascii=False)
+    hierarchy_nodes = await components.memory_service.rebuild_semantic_hierarchy() if updated else 0
+    return json.dumps(
+        {
+            "updated": updated,
+            "fact_id": fact_id,
+            "pinned": pinned,
+            "rebuilt_semantic_hierarchy_nodes": hierarchy_nodes,
+        },
+        ensure_ascii=False,
+    )
 
 
 @mcp.tool()
@@ -282,8 +416,14 @@ async def mark_semantic_fact_stale(fact_id: str, stale_days: int = 365) -> str:
         pinned=False,
         last_confirmed_at=stale_at,
     )
+    hierarchy_nodes = await components.memory_service.rebuild_semantic_hierarchy() if updated else 0
     return json.dumps(
-        {"updated": updated, "fact_id": fact_id, "last_confirmed_at": stale_at.isoformat()},
+        {
+            "updated": updated,
+            "fact_id": fact_id,
+            "last_confirmed_at": stale_at.isoformat(),
+            "rebuilt_semantic_hierarchy_nodes": hierarchy_nodes,
+        },
         ensure_ascii=False,
     )
 
@@ -313,12 +453,14 @@ async def prune_old_episodes(older_than_days: int = 180) -> str:
 
 @mcp.tool()
 async def export_memory(
-    layers: list[Literal["conversational", "episodic", "semantic", "procedural", "failure"]] | None = None,
+    layers: list[
+        Literal["conversational", "episodic", "semantic", "semantic_hierarchy", "procedural", "failure"]
+    ] | None = None,
     limit_per_layer: int = 100,
 ) -> str:
     """Export recent memory records by layer as JSON."""
     components = await _components()
-    selected = layers or ["conversational", "episodic", "semantic", "procedural", "failure"]
+    selected = layers or ["conversational", "episodic", "semantic", "semantic_hierarchy", "procedural", "failure"]
     limit = max(1, min(int(limit_per_layer), 1000))
     result: dict[str, Any] = {}
     for layer_name in selected:
@@ -358,12 +500,14 @@ async def import_memory(memory_json: str, import_semantic: bool = True) -> str:
             skipped += 1
             if len(errors) < 5:
                 errors.append(str(exc))
+    hierarchy_nodes = await components.memory_service.rebuild_semantic_hierarchy() if imported else 0
     return json.dumps(
         {
             "imported_semantic": imported,
             "skipped": skipped,
             "errors": errors,
             "non_semantic_layers": "skipped",
+            "rebuilt_semantic_hierarchy_nodes": hierarchy_nodes,
         },
         ensure_ascii=False,
     )

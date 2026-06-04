@@ -23,6 +23,8 @@ from core.models import (
     ProceduralWorkflow,
     RetrievalPlan,
     SemanticFactType,
+    SemanticHierarchyNode,
+    SemanticHierarchyNodeType,
     SemanticMemoryRecord,
     ToolInvocation,
     WorkflowStatus,
@@ -106,6 +108,16 @@ class AgenticMemoryService:
         lines.append("")
         lines.append("[KNOWN FACTS]")
         lines.extend(_render_semantic_lines(inferred_facts))
+
+        if retrieval_plan.semantic_hierarchy_records:
+            lines.append("")
+            lines.append("[SEMANTIC MEMORY SUMMARIES]")
+            for node in retrieval_plan.semantic_hierarchy_records:
+                if node.node_type == SemanticHierarchyNodeType.QA and node.question:
+                    answer = node.answer or node.content
+                    lines.append(f"- {node.question} {_excerpt(answer, 260)}")
+                else:
+                    lines.append(f"- {node.title}: {_excerpt(node.content, 300)}")
 
         if retrieval_plan.procedural_workflows:
             lines.append("")
@@ -199,11 +211,15 @@ class AgenticMemoryService:
         saved_episode = await self._store.save_episode(episode)
         writes.append("Saved 1 episodic episode")
 
-        saved_facts, semantic_conflicts = await self._consolidate_semantic_facts(
+        saved_facts, hierarchy_nodes, semantic_conflicts = await self._consolidate_semantic_facts(
             critic_evaluation, saved_episode.episode_id
         )
         if saved_facts:
             writes.append(f"Saved {saved_facts} semantic fact{'s' if saved_facts != 1 else ''}")
+        if hierarchy_nodes:
+            writes.append(
+                f"Updated {hierarchy_nodes} semantic hierarchy node{'s' if hierarchy_nodes != 1 else ''}"
+            )
         if semantic_conflicts:
             writes.append(f"Resolved {len(semantic_conflicts)} semantic conflict{'s' if len(semantic_conflicts) != 1 else ''}")
 
@@ -243,9 +259,10 @@ class AgenticMemoryService:
 
     async def _consolidate_semantic_facts(
         self, critic_evaluation: CriticEvaluation, episode_id: str
-    ) -> tuple[int, list[str]]:
+    ) -> tuple[int, int, list[str]]:
         """Deduplicate and save Critic-proposed semantic facts."""
         saved = 0
+        hierarchy_nodes = 0
         conflicts: list[str] = []
         facts = critic_evaluation.new_semantic_facts
         embeddings = await self._embedding_model.embed_batch([fact.content for fact in facts])
@@ -270,7 +287,8 @@ class AgenticMemoryService:
                         source_episode_id=episode_id,
                     )
                     if _new_fact_wins(existing, record):
-                        await self._store.replace_semantic(existing.fact_id, record)
+                        saved_record = await self._store.replace_semantic(existing.fact_id, record)
+                        hierarchy_nodes += await self._consolidate_semantic_hierarchy(saved_record)
                         conflicts.append(
                             f"semantic_conflict_replaced fact_id={existing.fact_id} old={_excerpt(existing.content, 80)} "
                             f"new={_excerpt(record.content, 80)}"
@@ -291,6 +309,11 @@ class AgenticMemoryService:
                     confidence_score=fact.confidence_score,
                     source=source,
                 )
+                existing.confidence_score = max(existing.confidence_score, fact.confidence_score)
+                existing.source = _stronger_source(existing.source, source)
+                existing.last_reinforced_at = utc_now()
+                existing.last_confirmed_at = existing.last_reinforced_at
+                hierarchy_nodes += await self._consolidate_semantic_hierarchy(existing)
                 continue
             record = SemanticMemoryRecord(
                 fact_type=fact.fact_type,
@@ -300,15 +323,114 @@ class AgenticMemoryService:
                 source=source,
                 source_episode_id=episode_id,
             )
-            await self._store.insert_semantic(record)
+            saved_record = await self._store.insert_semantic(record)
+            hierarchy_nodes += await self._consolidate_semantic_hierarchy(saved_record)
             saved += 1
-        return saved, conflicts
+        return saved, hierarchy_nodes, conflicts
+
+    async def _consolidate_semantic_hierarchy(self, fact: SemanticMemoryRecord) -> int:
+        """Update deterministic hierarchy nodes that aggregate semantic facts."""
+        facet = _semantic_facet(fact)
+        root = await self._upsert_hierarchy_node(
+            node_key="root",
+            parent_id=None,
+            node_type=SemanticHierarchyNodeType.ROOT,
+            facet="root",
+            title="Semantic Memory",
+            content="Top-level index for aggregated semantic memory.",
+            fact=fact,
+            question=None,
+            answer=None,
+        )
+        facet_node = await self._upsert_hierarchy_node(
+            node_key=f"facet:{facet}",
+            parent_id=root.node_id,
+            node_type=SemanticHierarchyNodeType.FACET,
+            facet=facet,
+            title=_facet_title(facet),
+            content=f"Facet for {_facet_title(facet).lower()} semantic memory.",
+            fact=fact,
+            question=None,
+            answer=None,
+        )
+        summary = await self._upsert_hierarchy_node(
+            node_key=f"summary:{facet}",
+            parent_id=facet_node.node_id,
+            node_type=SemanticHierarchyNodeType.SUMMARY,
+            facet=facet,
+            title=f"{_facet_title(facet)} Summary",
+            content=f"- {fact.content}",
+            fact=fact,
+            question=None,
+            answer=None,
+        )
+        question = _semantic_question(fact, facet)
+        qa = await self._upsert_hierarchy_node(
+            node_key=f"qa:{facet}:{_stable_hash(question)}",
+            parent_id=facet_node.node_id,
+            node_type=SemanticHierarchyNodeType.QA,
+            facet=facet,
+            title=question,
+            content=f"Q: {question}\nA: {fact.content}",
+            fact=fact,
+            question=question,
+            answer=fact.content,
+        )
+        return len({root.node_id, facet_node.node_id, summary.node_id, qa.node_id})
+
+    async def _upsert_hierarchy_node(
+        self,
+        *,
+        node_key: str,
+        parent_id: str | None,
+        node_type: SemanticHierarchyNodeType,
+        facet: str,
+        title: str,
+        content: str,
+        fact: SemanticMemoryRecord,
+        question: str | None,
+        answer: str | None,
+    ) -> SemanticHierarchyNode:
+        """Merge one semantic fact into a deterministic hierarchy node."""
+        existing = await self._store.get_semantic_hierarchy_node(node_key)
+        fact_ids = _merge_fact_ids(existing.source_fact_ids if existing else [], fact.fact_id)
+        merged_content = _merge_hierarchy_content(existing.content if existing else "", content, fact.content, node_type)
+        merged_answer = _merge_answer(existing.answer if existing else None, answer)
+        confidence = max(existing.confidence_score if existing else 0.0, fact.confidence_score)
+        node = SemanticHierarchyNode(
+            node_id=existing.node_id if existing else _stable_node_id(node_key),
+            node_key=node_key,
+            parent_id=parent_id if parent_id is not None else (existing.parent_id if existing else None),
+            node_type=node_type,
+            facet=facet,
+            title=title,
+            content=merged_content,
+            question=question if question is not None else (existing.question if existing else None),
+            answer=merged_answer,
+            source_fact_ids=fact_ids,
+            embedding=await self._embedding_model.embed(f"{title}\n{merged_content}\n{merged_answer or ''}"),
+            confidence_score=confidence,
+            created_at=existing.created_at if existing else utc_now(),
+            updated_at=utc_now(),
+        )
+        return await self._store.upsert_semantic_hierarchy_node(node)
 
     def semantic_cutoff(self) -> datetime | None:
         """Return the active semantic TTL cutoff, or None when TTL is disabled."""
         if self._semantic_memory_ttl_days <= 0:
             return None
         return datetime.now(timezone.utc) - timedelta(days=self._semantic_memory_ttl_days)
+
+    async def rebuild_semantic_hierarchy(self) -> int:
+        """Rebuild derived hierarchy nodes from currently active semantic facts."""
+        await self._store.clear_semantic_hierarchy()
+        records = await self._store.semantic_records_for_hierarchy(
+            last_confirmed_after=self.semantic_cutoff(),
+        )
+        updated = 0
+        for record in reversed(records):
+            updated += await self._consolidate_semantic_hierarchy(record)
+        return updated
 
     async def _consolidate_workflow(
         self,
@@ -506,6 +628,94 @@ def _new_fact_wins(existing: SemanticMemoryRecord, candidate: SemanticMemoryReco
 def _source_rank(source: str) -> int:
     """Return semantic source authority rank."""
     return {"llm_inferred": 1, "tool_derived": 2, "user_stated": 3}.get(source, 1)
+
+
+def _stronger_source(current: str, candidate: str | None) -> str:
+    """Return the higher-authority semantic source label."""
+    if not candidate:
+        return current
+    return candidate if _source_rank(candidate) > _source_rank(current) else current
+
+
+def _semantic_facet(fact: SemanticMemoryRecord) -> str:
+    """Map a semantic fact into a stable hierarchy facet."""
+    text = fact.content.lower()
+    if fact.fact_type == SemanticFactType.SYSTEM_RULE:
+        if any(word in text for word in ("project", "codebase", "stack", "repository", "repo")):
+            return "project_context"
+        return "environment"
+    if any(word in text for word in ("style", "tone", "format", "concise", "verbose", "bullet")):
+        return "communication_preferences"
+    if any(word in text for word in ("tool", "workflow", "process", "steps", "command", "terminal")):
+        return "workflow_preferences"
+    if fact.fact_type == SemanticFactType.PREFERENCE:
+        return "user_preferences"
+    return "general_knowledge"
+
+
+def _facet_title(facet: str) -> str:
+    """Render a facet key as a compact title."""
+    return " ".join(part.capitalize() for part in facet.split("_"))
+
+
+def _semantic_question(fact: SemanticMemoryRecord, facet: str) -> str:
+    """Create a Q&A retrieval question for one semantic fact."""
+    if fact.fact_type == SemanticFactType.PREFERENCE:
+        return f"What user preference is known for {_facet_title(facet).lower()}?"
+    if fact.fact_type == SemanticFactType.SYSTEM_RULE:
+        return f"What system or environment rule is known for {_facet_title(facet).lower()}?"
+    return f"What durable fact is known for {_facet_title(facet).lower()}?"
+
+
+def _stable_node_id(node_key: str) -> str:
+    """Build a deterministic node id from a hierarchy key."""
+    digest = hashlib.sha256(node_key.encode("utf-8")).hexdigest()
+    return f"{digest[:8]}-{digest[8:12]}-{digest[12:16]}-{digest[16:20]}-{digest[20:32]}"
+
+
+def _stable_hash(value: str) -> str:
+    """Return a short deterministic hash for node keys."""
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()[:16]
+
+
+def _merge_fact_ids(existing: list[str], fact_id: str) -> list[str]:
+    """Append a fact id once while keeping node payloads bounded."""
+    merged = [item for item in existing if item]
+    if fact_id not in merged:
+        merged.append(fact_id)
+    return merged[-24:]
+
+
+def _merge_hierarchy_content(
+    existing: str,
+    proposed: str,
+    fact_content: str,
+    node_type: SemanticHierarchyNodeType,
+) -> str:
+    """Merge hierarchy content without creating unbounded summaries."""
+    if node_type in {SemanticHierarchyNodeType.ROOT, SemanticHierarchyNodeType.FACET}:
+        return existing or proposed
+    if node_type == SemanticHierarchyNodeType.QA:
+        return existing or proposed
+    lines = [line for line in existing.splitlines() if line.strip()]
+    fact_line = f"- {fact_content}"
+    if fact_line not in lines:
+        lines.append(fact_line)
+    if not lines and proposed:
+        lines = [proposed]
+    return "\n".join(lines[-12:])
+
+
+def _merge_answer(existing: str | None, proposed: str | None) -> str | None:
+    """Merge a QA answer into a compact semicolon-separated list."""
+    if not proposed:
+        return existing
+    if not existing:
+        return proposed
+    parts = [part.strip() for part in existing.split(";") if part.strip()]
+    if proposed not in parts:
+        parts.append(proposed)
+    return "; ".join(parts[-6:])
 
 
 def _excerpt(text: str, max_length: int) -> str:

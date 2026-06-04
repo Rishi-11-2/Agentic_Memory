@@ -24,6 +24,8 @@ from core.models import (
     ProceduralToolStep,
     ProceduralWorkflow,
     SemanticFactType,
+    SemanticHierarchyNode,
+    SemanticHierarchyNodeType,
     SemanticMemoryRecord,
     ToolInvocation,
     WorkflowStatus,
@@ -92,6 +94,23 @@ CREATE TABLE IF NOT EXISTS am_semantic_memory (
     last_confirmed_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS am_semantic_hierarchy_nodes (
+    node_id TEXT PRIMARY KEY,
+    node_key TEXT NOT NULL UNIQUE,
+    parent_id TEXT,
+    node_type TEXT NOT NULL CHECK (node_type IN ('root', 'facet', 'summary', 'qa')),
+    facet TEXT NOT NULL DEFAULT 'general',
+    title TEXT NOT NULL,
+    content TEXT NOT NULL DEFAULT '',
+    question TEXT,
+    answer TEXT,
+    source_fact_ids TEXT NOT NULL DEFAULT '[]',
+    embedding TEXT,
+    confidence_score REAL NOT NULL DEFAULT 0.0 CHECK (confidence_score >= 0.0 AND confidence_score <= 1.0),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS am_procedural_workflows (
     workflow_id TEXT PRIMARY KEY,
     workflow_signature TEXT NOT NULL UNIQUE,
@@ -107,6 +126,7 @@ CREATE TABLE IF NOT EXISTS am_procedural_workflows (
 
 CREATE INDEX IF NOT EXISTS idx_conv_session ON am_conversation_turns (session_id, turn_index DESC);
 CREATE INDEX IF NOT EXISTS idx_summ_session ON am_conversation_summaries (session_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_semantic_hierarchy_facet ON am_semantic_hierarchy_nodes (facet, node_type);
 
 CREATE TABLE IF NOT EXISTS am_retrieval_feedback (
     session_id TEXT PRIMARY KEY,
@@ -437,6 +457,85 @@ class SQLiteMemoryStore(MemoryStore):
         scored = _rank_rows(rows, embedding, "embedding", threshold, limit)
         return [self._semantic_from_row(row, sim) for row, sim in scored]
 
+    async def semantic_records_for_hierarchy(
+        self, last_confirmed_after: datetime | None = None, limit: int = 500
+    ) -> list[SemanticMemoryRecord]:
+        """Return active semantic records for deterministic hierarchy rebuilds."""
+        sql = "SELECT * FROM am_semantic_memory"
+        params: list[object] = []
+        if last_confirmed_after is not None:
+            sql += " WHERE last_confirmed_at >= ? OR pinned = 1"
+            params.append(last_confirmed_after.isoformat())
+        sql += " ORDER BY last_confirmed_at DESC LIMIT ?"
+        params.append(max(1, min(int(limit), 5000)))
+        cursor = await self._db.execute(sql, params)
+        rows = await cursor.fetchall()
+        return [self._semantic_from_row(row) for row in rows]
+
+    async def clear_semantic_hierarchy(self) -> int:
+        """Delete all derived semantic hierarchy nodes."""
+        cursor = await self._db.execute("DELETE FROM am_semantic_hierarchy_nodes")
+        await self._db.commit()
+        return cursor.rowcount or 0
+
+    async def get_semantic_hierarchy_node(self, node_key: str) -> SemanticHierarchyNode | None:
+        """Return one semantic hierarchy node by deterministic key."""
+        cursor = await self._db.execute(
+            "SELECT * FROM am_semantic_hierarchy_nodes WHERE node_key = ?",
+            (node_key,),
+        )
+        row = await cursor.fetchone()
+        return self._semantic_hierarchy_from_row(row) if row is not None else None
+
+    async def upsert_semantic_hierarchy_node(self, node: SemanticHierarchyNode) -> SemanticHierarchyNode:
+        """Insert or update one semantic hierarchy aggregate node."""
+        await self._db.execute(
+            "INSERT INTO am_semantic_hierarchy_nodes "
+            "(node_id, node_key, parent_id, node_type, facet, title, content, question, answer, "
+            "source_fact_ids, embedding, confidence_score, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(node_key) DO UPDATE SET "
+            "parent_id = excluded.parent_id, "
+            "node_type = excluded.node_type, "
+            "facet = excluded.facet, "
+            "title = excluded.title, "
+            "content = excluded.content, "
+            "question = excluded.question, "
+            "answer = excluded.answer, "
+            "source_fact_ids = excluded.source_fact_ids, "
+            "embedding = excluded.embedding, "
+            "confidence_score = excluded.confidence_score, "
+            "updated_at = excluded.updated_at",
+            (
+                node.node_id,
+                node.node_key,
+                node.parent_id,
+                node.node_type.value,
+                node.facet,
+                node.title,
+                node.content,
+                node.question,
+                node.answer,
+                json.dumps(node.source_fact_ids),
+                json.dumps(node.embedding) if node.embedding else None,
+                node.confidence_score,
+                node.created_at.isoformat(),
+                node.updated_at.isoformat(),
+            ),
+        )
+        await self._db.commit()
+        saved = await self.get_semantic_hierarchy_node(node.node_key)
+        return saved or node
+
+    async def search_semantic_hierarchy(
+        self, embedding: list[float], limit: int, threshold: float
+    ) -> list[SemanticHierarchyNode]:
+        """Search hierarchical semantic aggregates using client-side cosine similarity."""
+        cursor = await self._db.execute("SELECT * FROM am_semantic_hierarchy_nodes")
+        rows = await cursor.fetchall()
+        scored = _rank_rows(rows, embedding, "embedding", threshold, limit)
+        return [self._semantic_hierarchy_from_row(row, sim) for row, sim in scored]
+
     # ── Procedural ──────────────────────────────────────────────────
 
     async def search_procedural(
@@ -512,6 +611,7 @@ class SQLiteMemoryStore(MemoryStore):
             MemoryLayer.CONVERSATIONAL: "am_conversation_turns",
             MemoryLayer.EPISODIC: "am_episodic_memory",
             MemoryLayer.SEMANTIC: "am_semantic_memory",
+            MemoryLayer.SEMANTIC_HIERARCHY: "am_semantic_hierarchy_nodes",
             MemoryLayer.PROCEDURAL: "am_procedural_workflows",
             MemoryLayer.FAILURE: "am_failure_episodes",
         }
@@ -519,6 +619,7 @@ class SQLiteMemoryStore(MemoryStore):
             MemoryLayer.CONVERSATIONAL: "timestamp",
             MemoryLayer.EPISODIC: "timestamp",
             MemoryLayer.SEMANTIC: "last_confirmed_at",
+            MemoryLayer.SEMANTIC_HIERARCHY: "updated_at",
             MemoryLayer.PROCEDURAL: "updated_at",
             MemoryLayer.FAILURE: "timestamp",
         }
@@ -537,6 +638,7 @@ class SQLiteMemoryStore(MemoryStore):
             MemoryLayer.CONVERSATIONAL: "am_conversation_turns",
             MemoryLayer.EPISODIC: "am_episodic_memory",
             MemoryLayer.SEMANTIC: "am_semantic_memory",
+            MemoryLayer.SEMANTIC_HIERARCHY: "am_semantic_hierarchy_nodes",
             MemoryLayer.PROCEDURAL: "am_procedural_workflows",
             MemoryLayer.FAILURE: "am_failure_episodes",
         }
@@ -678,6 +780,28 @@ class SQLiteMemoryStore(MemoryStore):
             score=similarity,
         )
 
+    def _semantic_hierarchy_from_row(self, row: Any, similarity: float | None = None) -> SemanticHierarchyNode:
+        """Convert a SQLite row into a semantic hierarchy node model."""
+        embedding = json.loads(row["embedding"]) if row["embedding"] else []
+        source_fact_ids = json.loads(row["source_fact_ids"]) if row["source_fact_ids"] else []
+        return SemanticHierarchyNode(
+            node_id=str(row["node_id"]),
+            node_key=str(row["node_key"]),
+            parent_id=cast(str | None, row["parent_id"]),
+            node_type=SemanticHierarchyNodeType(str(row["node_type"])),
+            facet=str(row["facet"] or "general"),
+            title=str(row["title"]),
+            content=str(row["content"] or ""),
+            question=cast(str | None, row["question"]),
+            answer=cast(str | None, row["answer"]),
+            source_fact_ids=[str(item) for item in source_fact_ids],
+            embedding=embedding,
+            confidence_score=float(row["confidence_score"] or 0.0),
+            created_at=row["created_at"] or utc_now(),
+            updated_at=row["updated_at"] or utc_now(),
+            score=similarity,
+        )
+
     def _workflow_from_row(self, row: Any, similarity: float | None = None) -> ProceduralWorkflow:
         """Convert a SQLite row into a procedural workflow model."""
         tool_seq = json.loads(row["tool_sequence"]) if row["tool_sequence"] else []
@@ -730,6 +854,27 @@ async def _migrate_schema(db: aiosqlite.Connection) -> None:
         "procedural_weight REAL NOT NULL DEFAULT 1.0, "
         "episodic_weight REAL NOT NULL DEFAULT 1.0, "
         "updated_at TEXT NOT NULL)"
+    )
+    await db.execute(
+        "CREATE TABLE IF NOT EXISTS am_semantic_hierarchy_nodes ("
+        "node_id TEXT PRIMARY KEY, "
+        "node_key TEXT NOT NULL UNIQUE, "
+        "parent_id TEXT, "
+        "node_type TEXT NOT NULL CHECK (node_type IN ('root', 'facet', 'summary', 'qa')), "
+        "facet TEXT NOT NULL DEFAULT 'general', "
+        "title TEXT NOT NULL, "
+        "content TEXT NOT NULL DEFAULT '', "
+        "question TEXT, "
+        "answer TEXT, "
+        "source_fact_ids TEXT NOT NULL DEFAULT '[]', "
+        "embedding TEXT, "
+        "confidence_score REAL NOT NULL DEFAULT 0.0 CHECK (confidence_score >= 0.0 AND confidence_score <= 1.0), "
+        "created_at TEXT NOT NULL, "
+        "updated_at TEXT NOT NULL)"
+    )
+    await db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_semantic_hierarchy_facet "
+        "ON am_semantic_hierarchy_nodes (facet, node_type)"
     )
 
 

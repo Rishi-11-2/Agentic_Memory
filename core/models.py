@@ -23,6 +23,7 @@ class MemoryLayer(str, Enum):
     CONVERSATIONAL = "conversational"
     EPISODIC = "episodic"
     SEMANTIC = "semantic"
+    SEMANTIC_HIERARCHY = "semantic_hierarchy"
     PROCEDURAL = "procedural"
     FAILURE = "failure"
 
@@ -48,6 +49,15 @@ class SemanticFactType(str, Enum):
     PREFERENCE = "preference"
     INFERRED_FACT = "inferred_fact"
     SYSTEM_RULE = "system_rule"
+
+
+class SemanticHierarchyNodeType(str, Enum):
+    """Classify semantic hierarchy nodes by abstraction level."""
+
+    ROOT = "root"
+    FACET = "facet"
+    SUMMARY = "summary"
+    QA = "qa"
 
 
 class WorkflowStatus(str, Enum):
@@ -170,6 +180,26 @@ class SemanticMemoryRecord(BaseModel):
     score: float | None = Field(default=None, ge=0.0, le=1.0)
 
 
+class SemanticHierarchyNode(BaseModel):
+    """Store a hierarchical aggregate derived from flat semantic facts."""
+
+    node_id: str = Field(default_factory=lambda: str(uuid4()))
+    node_key: str
+    parent_id: str | None = None
+    node_type: SemanticHierarchyNodeType
+    facet: str = "general"
+    title: str
+    content: str = ""
+    question: str | None = None
+    answer: str | None = None
+    source_fact_ids: list[str] = Field(default_factory=list)
+    embedding: list[float] = Field(default_factory=list)
+    confidence_score: float = Field(default=0.0, ge=0.0, le=1.0)
+    created_at: datetime = Field(default_factory=utc_now)
+    updated_at: datetime = Field(default_factory=utc_now)
+    score: float | None = Field(default=None, ge=0.0, le=1.0)
+
+
 class ProceduralToolStep(BaseModel):
     """Describe one reusable tool step inside a learned workflow."""
 
@@ -224,6 +254,7 @@ class RetrievalPlan(BaseModel):
     conversation_summaries: list[ConversationalSummary] = Field(default_factory=list)
     episodic_records: list[EpisodeRecord] = Field(default_factory=list)
     semantic_records: list[SemanticMemoryRecord] = Field(default_factory=list)
+    semantic_hierarchy_records: list[SemanticHierarchyNode] = Field(default_factory=list)
     procedural_workflows: list[ProceduralWorkflow] = Field(default_factory=list)
     failure_matches: list[FailureEpisode] = Field(default_factory=list)
     retrieved_records: list[RetrievedRecord] = Field(default_factory=list)
@@ -234,6 +265,8 @@ class RetrievalPlan(BaseModel):
         skipped: list[str] = []
         if self.query_semantic:
             queried.append(f"semantic ({len(self.semantic_records)} facts)")
+            if self.semantic_hierarchy_records:
+                queried.append(f"semantic_hierarchy ({len(self.semantic_hierarchy_records)} nodes)")
         else:
             skipped.append("semantic (no trigger)")
         if self.query_procedural:

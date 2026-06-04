@@ -71,6 +71,25 @@ create table if not exists am_semantic_memory (
     last_confirmed_at timestamptz not null default now()
 );
 
+create table if not exists am_semantic_hierarchy_nodes (
+    node_id uuid primary key,
+    node_key text not null unique,
+    parent_id uuid references am_semantic_hierarchy_nodes(node_id) on delete set null,
+    node_type text not null check (node_type in ('root', 'facet', 'summary', 'qa')),
+    facet text not null default 'general',
+    title text not null,
+    content text not null default '',
+    question text,
+    answer text,
+    source_fact_ids jsonb not null default '[]'::jsonb,
+    embedding vector(384),
+    hash_embedding vector(256),
+    confidence_score double precision not null default 0.0
+        check (confidence_score >= 0.0 and confidence_score <= 1.0),
+    created_at timestamptz not null default now(),
+    updated_at timestamptz not null default now()
+);
+
 alter table am_semantic_memory
     add column if not exists source text not null default 'llm_inferred';
 
@@ -133,6 +152,17 @@ create index if not exists am_semantic_embedding_ivfflat_idx
 
 create index if not exists am_semantic_hash_embedding_ivfflat_idx
     on am_semantic_memory using ivfflat (hash_embedding vector_cosine_ops) with (lists = 100)
+    where hash_embedding is not null;
+
+create index if not exists am_semantic_hierarchy_facet_idx
+    on am_semantic_hierarchy_nodes (facet, node_type);
+
+create index if not exists am_semantic_hierarchy_embedding_ivfflat_idx
+    on am_semantic_hierarchy_nodes using ivfflat (embedding vector_cosine_ops) with (lists = 100)
+    where embedding is not null;
+
+create index if not exists am_semantic_hierarchy_hash_embedding_ivfflat_idx
+    on am_semantic_hierarchy_nodes using ivfflat (hash_embedding vector_cosine_ops) with (lists = 100)
     where hash_embedding is not null;
 
 create index if not exists am_episodic_embedding_ivfflat_idx

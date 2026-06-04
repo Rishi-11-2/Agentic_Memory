@@ -15,6 +15,8 @@ stronger Critic or enable standalone Actor-Critic mode.
   and failures.
 - Two-tool MCP workflow: retrieve context before answering, consolidate after
   answering.
+- Optional external-orchestrator workflow where Codex, Claude Code, or another
+  MCP client plans memory-layer tool calls directly.
 - Deterministic zero-key mode for local use.
 - Optional Anthropic, OpenAI, or Groq Critic for deeper evaluation.
 - SQLite by default, with PostgreSQL/pgvector support for larger deployments.
@@ -49,6 +51,7 @@ and links derived records back to that episode where useful.
 | Conversational | Recent user and assistant messages | Every `consolidate_turn` call | Kept as a sliding window; older turns can be rolled into summaries. |
 | Episodic | Full completed turns with prompt, response, tools, outcome, latency, and errors | Every completed turn | Append-only audit trail used for similar-past-episode recall. |
 | Semantic | Durable preferences, environment facts, and system rules | Critic/heuristic fact extraction and `new_facts` | Deduplicated by embedding similarity; conflicts are resolved by source, confidence, and recency. |
+| Semantic hierarchy | Facets, summaries, and Q&A nodes derived from semantic facts | Every saved or reinforced semantic fact | Deterministic hierarchical aggregates for broader preference/context retrieval. |
 | Procedural | Reusable multi-step tool workflows | Successful turns with at least two successful tool calls | Upserted by workflow signature and promoted by repeated success. |
 | Failure | Tool failures worth avoiding later | Critic-flagged failed tool calls | Linked to the source episode; preserved when old episodes are pruned. |
 
@@ -59,9 +62,22 @@ completed turn
   -> conversational messages
   -> episodic record
   -> semantic facts, if durable facts/preferences/rules are found
+  -> semantic hierarchy nodes, if semantic facts are saved or reinforced
   -> procedural workflow, if a successful repeatable tool chain is found
   -> failure record, if a tool failure should be remembered
 ```
+
+## Retrieval Orchestration
+
+The default quick path is still `get_session_context`, which uses the local
+heuristic planner plus vector search.
+
+For a CMA-style agentic retrieval loop, the LLM orchestrator is the MCP client
+itself: Codex, Claude Code, Cline, or another assistant. Call
+`get_memory_tool_manifest` to see the available memory tools, then call
+`retrieve_memory_layer` one or more times with refined queries across
+conversational, semantic, semantic hierarchy, episodic, procedural, and failure
+memory. No additional internal LLM provider is required for retrieval planning.
 
 ## Install
 
@@ -170,7 +186,7 @@ Open the Cline MCP settings file and add the stdio server:
 To skip approval prompts for the common memory calls:
 
 ```json
-"autoApprove": ["get_session_context", "consolidate_turn", "search_memory"]
+"autoApprove": ["get_session_context", "get_memory_tool_manifest", "retrieve_memory_layer", "consolidate_turn", "search_memory"]
 ```
 
 For clients that need HTTP/SSE, start the MCP server with HTTP transport:
@@ -226,9 +242,11 @@ This enables the extra MCP tool `run_autonomous_turn`.
 
 | Tool | Parameters | Purpose |
 |---|---|---|
+| `get_memory_tool_manifest` | none | Describe memory layers and retrieval-tool strategy for Codex/Claude-style external orchestration. |
 | `get_session_context` | `user_message`, `session_id` | Retrieve memory-enriched context before the agent answers. |
+| `retrieve_memory_layer` | `query`, `layer`, `session_id?`, `top_k?` | Query one memory layer so the external MCP client can plan multi-step retrieval. |
 | `consolidate_turn` | `session_id`, `user_message`, `assistant_response`, `tool_calls_json?`, `new_facts?`, `failure_summary?`, `quality_score?`, `reasoning_summary?` | Save and learn from a completed turn. |
-| `search_memory` | `query`, `layers?`, `top_k?` | Search semantic, episodic, procedural, and failure memory by similarity. |
+| `search_memory` | `query`, `layers?`, `top_k?` | Search semantic, semantic hierarchy, episodic, procedural, and failure memory by similarity. |
 | `get_conversation_history` | `session_id`, `last_n?` | Fetch recent conversation messages. |
 | `clear_session_memory` | `session_id` | Clear only the session's conversational window. |
 | `inspect_memory_layers` | `limit?` | Show counts and recent records by layer. |

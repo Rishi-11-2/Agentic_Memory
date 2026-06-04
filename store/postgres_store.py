@@ -23,6 +23,8 @@ from core.models import (
     ProceduralToolStep,
     ProceduralWorkflow,
     SemanticFactType,
+    SemanticHierarchyNode,
+    SemanticHierarchyNodeType,
     SemanticMemoryRecord,
     ToolInvocation,
     WorkflowStatus,
@@ -391,6 +393,96 @@ class PostgresMemoryStore(MemoryStore):
             )
         return self._rank_semantic(rows, embedding, threshold, limit)
 
+    async def semantic_records_for_hierarchy(
+        self, last_confirmed_after: datetime | None = None, limit: int = 500
+    ) -> list[SemanticMemoryRecord]:
+        """Return active semantic records for deterministic hierarchy rebuilds."""
+        bounded_limit = max(1, min(int(limit), 5000))
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT * FROM am_semantic_memory "
+                "WHERE ($1::timestamptz IS NULL OR last_confirmed_at >= $1::timestamptz OR pinned) "
+                "ORDER BY last_confirmed_at DESC LIMIT $2",
+                last_confirmed_after,
+                bounded_limit,
+            )
+        return [self._semantic_from_row(row) for row in rows]
+
+    async def clear_semantic_hierarchy(self) -> int:
+        """Delete all derived semantic hierarchy nodes."""
+        async with self._pool.acquire() as conn:
+            result = await conn.execute("DELETE FROM am_semantic_hierarchy_nodes")
+        return _row_count(result)
+
+    async def get_semantic_hierarchy_node(self, node_key: str) -> SemanticHierarchyNode | None:
+        """Return one semantic hierarchy node by deterministic key."""
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT * FROM am_semantic_hierarchy_nodes WHERE node_key = $1",
+                node_key,
+            )
+        return self._semantic_hierarchy_from_row(row) if row is not None else None
+
+    async def upsert_semantic_hierarchy_node(self, node: SemanticHierarchyNode) -> SemanticHierarchyNode:
+        """Insert or update one semantic hierarchy aggregate node."""
+        embedding = node.embedding if node.embedding else None
+        vec_col, vec_val = _semantic_embedding_columns(embedding)
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(
+                f"INSERT INTO am_semantic_hierarchy_nodes "
+                f"(node_id, node_key, parent_id, node_type, facet, title, content, question, answer, "
+                f"source_fact_ids, {vec_col}, confidence_score, created_at, updated_at) "
+                f"VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb, $11::vector, $12, $13, $14) "
+                f"ON CONFLICT (node_key) DO UPDATE SET "
+                f"parent_id = excluded.parent_id, "
+                f"node_type = excluded.node_type, "
+                f"facet = excluded.facet, "
+                f"title = excluded.title, "
+                f"content = excluded.content, "
+                f"question = excluded.question, "
+                f"answer = excluded.answer, "
+                f"source_fact_ids = excluded.source_fact_ids, "
+                f"{vec_col} = excluded.{vec_col}, "
+                f"confidence_score = excluded.confidence_score, "
+                f"updated_at = excluded.updated_at "
+                f"RETURNING *",
+                node.node_id,
+                node.node_key,
+                node.parent_id,
+                node.node_type.value,
+                node.facet,
+                node.title,
+                node.content,
+                node.question,
+                node.answer,
+                json.dumps(node.source_fact_ids),
+                _vec_literal(vec_val),
+                node.confidence_score,
+                node.created_at,
+                node.updated_at,
+            )
+        return self._semantic_hierarchy_from_row(row) if row is not None else node
+
+    async def search_semantic_hierarchy(
+        self, embedding: list[float], limit: int, threshold: float
+    ) -> list[SemanticHierarchyNode]:
+        """Search hierarchical semantic aggregates using pgvector cosine similarity."""
+        if len(embedding) == 384:
+            async with self._pool.acquire() as conn:
+                rows = await conn.fetch(
+                    "SELECT *, 1 - (embedding <=> $1::vector) AS similarity "
+                    "FROM am_semantic_hierarchy_nodes WHERE embedding IS NOT NULL "
+                    "AND 1 - (embedding <=> $1::vector) >= $2 "
+                    "ORDER BY embedding <=> $1::vector LIMIT $3",
+                    _vec_literal(embedding), threshold, limit,
+                )
+            return [self._semantic_hierarchy_from_row(row) for row in rows]
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT * FROM am_semantic_hierarchy_nodes LIMIT 200"
+            )
+        return self._rank_semantic_hierarchy(rows, embedding, threshold, limit)
+
     # ── Procedural ──────────────────────────────────────────────────
 
     async def search_procedural(
@@ -479,6 +571,7 @@ class PostgresMemoryStore(MemoryStore):
             MemoryLayer.CONVERSATIONAL: "am_conversation_turns",
             MemoryLayer.EPISODIC: "am_episodic_memory",
             MemoryLayer.SEMANTIC: "am_semantic_memory",
+            MemoryLayer.SEMANTIC_HIERARCHY: "am_semantic_hierarchy_nodes",
             MemoryLayer.PROCEDURAL: "am_procedural_workflows",
             MemoryLayer.FAILURE: "am_failure_episodes",
         }
@@ -486,6 +579,7 @@ class PostgresMemoryStore(MemoryStore):
             MemoryLayer.CONVERSATIONAL: "timestamp",
             MemoryLayer.EPISODIC: "timestamp",
             MemoryLayer.SEMANTIC: "last_confirmed_at",
+            MemoryLayer.SEMANTIC_HIERARCHY: "updated_at",
             MemoryLayer.PROCEDURAL: "updated_at",
             MemoryLayer.FAILURE: "timestamp",
         }
@@ -504,6 +598,7 @@ class PostgresMemoryStore(MemoryStore):
             MemoryLayer.CONVERSATIONAL: "am_conversation_turns",
             MemoryLayer.EPISODIC: "am_episodic_memory",
             MemoryLayer.SEMANTIC: "am_semantic_memory",
+            MemoryLayer.SEMANTIC_HIERARCHY: "am_semantic_hierarchy_nodes",
             MemoryLayer.PROCEDURAL: "am_procedural_workflows",
             MemoryLayer.FAILURE: "am_failure_episodes",
         }
@@ -647,6 +742,30 @@ class PostgresMemoryStore(MemoryStore):
             score=_clip_similarity(row.get("similarity")),
         )
 
+    def _semantic_hierarchy_from_row(self, row: Any) -> SemanticHierarchyNode:
+        """Convert a PostgreSQL row into a semantic hierarchy node model."""
+        embedding = _parse_pg_vector(row.get("embedding") or row.get("hash_embedding"))
+        source_fact_ids = row.get("source_fact_ids") or []
+        if isinstance(source_fact_ids, str):
+            source_fact_ids = json.loads(source_fact_ids)
+        return SemanticHierarchyNode(
+            node_id=str(row["node_id"]),
+            node_key=str(row["node_key"]),
+            parent_id=cast(str | None, row.get("parent_id")),
+            node_type=SemanticHierarchyNodeType(str(row["node_type"])),
+            facet=str(row.get("facet") or "general"),
+            title=str(row["title"]),
+            content=str(row.get("content") or ""),
+            question=cast(str | None, row.get("question")),
+            answer=cast(str | None, row.get("answer")),
+            source_fact_ids=[str(item) for item in source_fact_ids],
+            embedding=embedding,
+            confidence_score=float(row.get("confidence_score") or 0.0),
+            created_at=row.get("created_at") or utc_now(),
+            updated_at=row.get("updated_at") or utc_now(),
+            score=_clip_similarity(row.get("similarity")),
+        )
+
     def _workflow_from_row(self, row: Any) -> ProceduralWorkflow:
         """Convert a PostgreSQL row into a procedural workflow model."""
         tool_seq = row.get("tool_sequence") or []
@@ -685,6 +804,13 @@ class PostgresMemoryStore(MemoryStore):
         scored = _client_rank(rows, embedding, "hash_embedding", threshold, limit)
         return [self._semantic_from_row(row) for row in scored]
 
+    def _rank_semantic_hierarchy(
+        self, rows: list[Any], embedding: list[float], threshold: float, limit: int
+    ) -> list[SemanticHierarchyNode]:
+        """Rank semantic hierarchy rows by client-side cosine similarity."""
+        scored = _client_rank(rows, embedding, "hash_embedding", threshold, limit)
+        return [self._semantic_hierarchy_from_row(row) for row in scored]
+
     def _rank_workflows(self, rows: list[Any], embedding: list[float], threshold: float, limit: int) -> list[ProceduralWorkflow]:
         """Rank workflow rows by client-side cosine similarity."""
         scored = _client_rank(rows, embedding, "hash_embedding", threshold, limit)
@@ -719,6 +845,39 @@ async def _migrate_schema(conn: asyncpg.Connection) -> None:
         "procedural_weight double precision not null default 1.0, "
         "episodic_weight double precision not null default 1.0, "
         "updated_at timestamptz not null default now())"
+    )
+    await conn.execute(
+        "CREATE TABLE IF NOT EXISTS am_semantic_hierarchy_nodes ("
+        "node_id uuid primary key, "
+        "node_key text not null unique, "
+        "parent_id uuid references am_semantic_hierarchy_nodes(node_id) on delete set null, "
+        "node_type text not null check (node_type in ('root', 'facet', 'summary', 'qa')), "
+        "facet text not null default 'general', "
+        "title text not null, "
+        "content text not null default '', "
+        "question text, "
+        "answer text, "
+        "source_fact_ids jsonb not null default '[]'::jsonb, "
+        "embedding vector(384), "
+        "hash_embedding vector(256), "
+        "confidence_score double precision not null default 0.0 "
+        "check (confidence_score >= 0.0 and confidence_score <= 1.0), "
+        "created_at timestamptz not null default now(), "
+        "updated_at timestamptz not null default now())"
+    )
+    await conn.execute(
+        "CREATE INDEX IF NOT EXISTS am_semantic_hierarchy_facet_idx "
+        "ON am_semantic_hierarchy_nodes (facet, node_type)"
+    )
+    await conn.execute(
+        "CREATE INDEX IF NOT EXISTS am_semantic_hierarchy_embedding_ivfflat_idx "
+        "ON am_semantic_hierarchy_nodes USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100) "
+        "WHERE embedding IS NOT NULL"
+    )
+    await conn.execute(
+        "CREATE INDEX IF NOT EXISTS am_semantic_hierarchy_hash_embedding_ivfflat_idx "
+        "ON am_semantic_hierarchy_nodes USING ivfflat (hash_embedding vector_cosine_ops) WITH (lists = 100) "
+        "WHERE hash_embedding IS NOT NULL"
     )
     semantic_table_exists = await conn.fetchval("SELECT to_regclass('public.am_semantic_memory') IS NOT NULL")
     if semantic_table_exists:

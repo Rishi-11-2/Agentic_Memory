@@ -416,7 +416,7 @@ class MemorySearchTool:
 
         top_k = _bounded_int(params.get("top_k"), 5, minimum=1, maximum=20)
         raw_layers = params.get("layers")
-        valid_layers = {"semantic", "episodic", "procedural", "failure"}
+        valid_layers = {"semantic", "semantic_hierarchy", "episodic", "procedural", "failure"}
         if isinstance(raw_layers, list):
             selected = [layer for layer in raw_layers if layer in valid_layers] or list(valid_layers)
         else:
@@ -435,6 +435,18 @@ class MemorySearchTool:
                 for record in records:
                     score_text = f"{record.score:.2f}" if record.score is not None else "n/a"
                     lines.append(f"    [{score_text}] {_excerpt(record.content, 200)} (source={record.source})")
+                sections.append("\n".join(lines))
+
+        if "semantic_hierarchy" in selected:
+            records = await self._store.search_semantic_hierarchy(embedding, top_k, 0.30)
+            if records:
+                lines = [f"  SEMANTIC HIERARCHY ({len(records)} results):"]
+                for record in records:
+                    score_text = f"{record.score:.2f}" if record.score is not None else "n/a"
+                    lines.append(
+                        f"    [{score_text}] {record.node_type.value}/{record.facet}: "
+                        f"{_excerpt(record.title, 80)} -> {_excerpt(record.content, 160)}"
+                    )
                 sections.append("\n".join(lines))
 
         if "episodic" in selected:
@@ -820,11 +832,12 @@ def default_tool_registry(
             name="memory_search",
             description=(
                 "Searches the agent's own vector memory for past interactions, learned facts, "
-                "known workflows, and past failures. Layers: semantic, episodic, procedural, failure."
+                "semantic hierarchy summaries, known workflows, and past failures. Layers: semantic, "
+                "semantic_hierarchy, episodic, procedural, failure."
             ),
             input_schema={
                 "query": "string, what to search for in memory",
-                "layers": "list optional, subset of [semantic, episodic, procedural, failure]",
+                "layers": "list optional, subset of [semantic, semantic_hierarchy, episodic, procedural, failure]",
                 "top_k": "integer optional, 1-20 (default 5)",
             },
         ),

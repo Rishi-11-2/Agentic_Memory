@@ -22,6 +22,8 @@ from core.models import (
     ProceduralWorkflow,
     RetrievalPlan,
     SemanticFactType,
+    SemanticHierarchyNode,
+    SemanticHierarchyNodeType,
     SemanticMemoryRecord,
     ToolInvocation,
 )
@@ -92,6 +94,7 @@ class AgenticMemoryHarness(unittest.IsolatedAsyncioTestCase):
             loop_latency_ms=1,
         )
         self.assertEqual(await self.store.count_layer(MemoryLayer.SEMANTIC), 1)
+        self.assertGreaterEqual(await self.store.count_layer(MemoryLayer.SEMANTIC_HIERARCHY), 4)
 
         records = await self.store.search_semantic(
             await self.embedding.embed("concise answers"),
@@ -111,6 +114,16 @@ class AgenticMemoryHarness(unittest.IsolatedAsyncioTestCase):
             last_confirmed_after=datetime.now(timezone.utc) - timedelta(days=30),
         )
         self.assertEqual([record.fact_id for record in pinned_records], [fact_id])
+
+        hierarchy_records = await self.store.search_semantic_hierarchy(
+            await self.embedding.embed("concise answers preference"),
+            limit=5,
+            threshold=0.0,
+        )
+        self.assertTrue(any("Concise" in record.content or "concise" in record.content for record in hierarchy_records))
+
+        plan = await self.planner.plan("I prefer concise answers", "semantic")
+        self.assertTrue(plan.semantic_hierarchy_records)
         self.assertTrue(await self.store.delete_semantic(fact_id))
 
     async def test_planner_feedback_persists_between_instances(self) -> None:
@@ -155,11 +168,22 @@ class AgenticMemoryHarness(unittest.IsolatedAsyncioTestCase):
                     confidence_score=0.8,
                 )
             ],
+            semantic_hierarchy_records=[
+                SemanticHierarchyNode(
+                    node_key="summary:project_context",
+                    node_type=SemanticHierarchyNodeType.SUMMARY,
+                    facet="project_context",
+                    title="Project Context Summary",
+                    content="- The project uses SQLite in local mode.",
+                    confidence_score=0.8,
+                )
+            ],
             procedural_workflows=workflows,
         )
         context = await self.service.build_context(plan)
         self.assertIn("[KNOWN FACTS]", context.rendered_context)
         self.assertIn("The project uses SQLite", context.rendered_context)
+        self.assertIn("[SEMANTIC MEMORY SUMMARIES]", context.rendered_context)
         self.assertIn("Workflow 1", context.rendered_context)
         self.assertIn("Workflow 2", context.rendered_context)
 

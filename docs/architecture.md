@@ -19,6 +19,13 @@ MCP mode is the primary product path. The agent calls `get_session_context` befo
 
 `consolidate_turn` wraps the external response as an `ActorResult`, sends it through `AutoEvaluationService`, then writes conversational, episodic, semantic, procedural, and failure memories through `AgenticMemoryService`.
 
+For agentic retrieval orchestration, the external MCP client is the LLM
+orchestrator. Codex, Claude Code, Cline, or another assistant can call
+`get_memory_tool_manifest`, then invoke `retrieve_memory_layer` repeatedly to
+plan and synthesize retrieval across conversational, semantic, semantic
+hierarchy, episodic, procedural, and failure memory. This avoids adding a
+second hidden LLM provider just for retrieval planning.
+
 ## Standalone Mode
 
 Standalone mode is optional and requires an LLM provider. In this mode the project creates its own `Actor`, `Critic`, tool registry, planner, and memory service, then runs the six-phase loop in `runtime/self_learning_loop.py`.
@@ -29,11 +36,22 @@ Standalone mode is optional and requires an LLM provider. In this mode the proje
 
 ## Retrieval
 
-The planner combines keyword triggers with vector search and adaptive per-session weights. Feedback weights are persisted through the store contract, so retrieval tuning survives process restarts. Retrieved records are re-ranked before context rendering using similarity, recency, confidence, outcome quality, workflow maturity, and pinning.
+The quick-path planner combines keyword triggers with vector search and adaptive per-session weights. Feedback weights are persisted through the store contract, so retrieval tuning survives process restarts. Retrieved records are re-ranked before context rendering using similarity, recency, confidence, outcome quality, workflow maturity, hierarchy-node abstraction level, and pinning.
+
+Semantic hierarchy records are deterministic aggregates derived from flat
+semantic facts. Each saved or reinforced semantic fact updates a root index,
+facet node, facet summary, and Q&A-style node. This gives retrieval a
+hierarchical semantic layer without requiring asynchronous batch jobs or an
+internal planner LLM.
 
 ## Memory Governance
 
 Semantic facts can be deleted, pinned, marked stale, exported, and imported. Pinned facts bypass semantic TTL filtering. Episodic memories remain append-only by default, but old episodes can be pruned while failure records are detached and preserved.
+
+Semantic hierarchy nodes are derived data. When semantic facts are deleted,
+pinned, marked stale, or imported through the MCP management tools, the
+hierarchy is rebuilt from the currently active semantic facts so stale derived
+content is not retained.
 
 ## Testing
 

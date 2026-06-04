@@ -12,6 +12,7 @@ from core.models import (
     ProceduralWorkflow,
     RetrievedRecord,
     RetrievalPlan,
+    SemanticHierarchyNode,
     SemanticMemoryRecord,
 )
 from model.embedding_model import EmbeddingModel
@@ -91,6 +92,7 @@ class HeuristicRetrievalPlanner:
             query_procedural = True
 
         semantic_records = []
+        semantic_hierarchy_records = []
         if query_semantic:
             semantic_records = await self._store.search_semantic(
                 embedding,
@@ -100,6 +102,9 @@ class HeuristicRetrievalPlanner:
                 last_confirmed_after=self._semantic_cutoff(),
             )
             semantic_records = _rank_semantic_records(semantic_records)[:5]
+            semantic_hierarchy_records = _rank_semantic_hierarchy_records(
+                await self._store.search_semantic_hierarchy(embedding, 8, 0.30)
+            )[:4]
 
         procedural_workflows = trigger_workflows
         if query_procedural:
@@ -128,6 +133,7 @@ class HeuristicRetrievalPlanner:
             episodic_records=episodic_records,
             failure_matches=failure_matches,
             semantic_count=len(semantic_records),
+            semantic_hierarchy_count=len(semantic_hierarchy_records),
             workflow_count=len(procedural_workflows),
         )
 
@@ -145,6 +151,7 @@ class HeuristicRetrievalPlanner:
             conversation_summaries=summaries,
             episodic_records=episodic_records,
             semantic_records=semantic_records,
+            semantic_hierarchy_records=semantic_hierarchy_records,
             procedural_workflows=procedural_workflows,
             failure_matches=failure_matches,
             retrieved_records=retrieved,
@@ -238,6 +245,7 @@ def _build_retrieved_records(
     episodic_records: list[EpisodeRecord],
     failure_matches: list[FailureEpisode],
     semantic_count: int,
+    semantic_hierarchy_count: int,
     workflow_count: int,
 ) -> list[RetrievedRecord]:
     """Build auditable retrieval pointers without exposing raw records to API users."""
@@ -267,6 +275,15 @@ def _build_retrieved_records(
                 record_id="semantic-batch",
                 score=1.0,
                 rationale=f"{semantic_count} semantic facts selected.",
+            )
+        )
+    if semantic_hierarchy_count:
+        records.append(
+            RetrievedRecord(
+                layer=MemoryLayer.SEMANTIC_HIERARCHY,
+                record_id="semantic-hierarchy-batch",
+                score=1.0,
+                rationale=f"{semantic_hierarchy_count} semantic hierarchy nodes selected.",
             )
         )
     if workflow_count:
@@ -301,6 +318,21 @@ def _rank_semantic_records(records: list[SemanticMemoryRecord]) -> list[Semantic
         recency = _recency_score(record.last_confirmed_at, half_life_days=45)
         pinned_bonus = 1.0 if getattr(record, "pinned", False) else 0.0
         record.score = _clip_score((0.55 * similarity) + (0.30 * confidence) + (0.10 * recency) + (0.05 * pinned_bonus))
+    records.sort(key=lambda item: item.score or 0.0, reverse=True)
+    return records
+
+
+def _rank_semantic_hierarchy_records(records: list[SemanticHierarchyNode]) -> list[SemanticHierarchyNode]:
+    """Re-rank semantic aggregates by similarity, confidence, abstraction level, and freshness."""
+    level_score = {"root": 0.25, "facet": 0.45, "summary": 0.90, "qa": 1.0}
+    for record in records:
+        similarity = record.score or 0.0
+        confidence = record.confidence_score
+        recency = _recency_score(record.updated_at, half_life_days=60)
+        abstraction = level_score.get(record.node_type.value, 0.5)
+        record.score = _clip_score(
+            (0.50 * similarity) + (0.25 * confidence) + (0.15 * abstraction) + (0.10 * recency)
+        )
     records.sort(key=lambda item: item.score or 0.0, reverse=True)
     return records
 

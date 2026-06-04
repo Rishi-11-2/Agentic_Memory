@@ -12,6 +12,7 @@ from core.models import (
     FailureEpisode,
     MemoryLayer,
     ProceduralWorkflow,
+    SemanticHierarchyNode,
     SemanticMemoryRecord,
 )
 
@@ -131,6 +132,30 @@ class MemoryStore(Protocol):
         last_confirmed_after: datetime | None = None,
     ) -> list[SemanticMemoryRecord]:
         """Search semantic memory using cosine similarity and confidence filtering."""
+        ...
+
+    async def semantic_records_for_hierarchy(
+        self, last_confirmed_after: datetime | None = None, limit: int = 500
+    ) -> list[SemanticMemoryRecord]:
+        """Return active semantic records for deterministic hierarchy rebuilds."""
+        ...
+
+    async def clear_semantic_hierarchy(self) -> int:
+        """Delete all derived semantic hierarchy nodes."""
+        ...
+
+    async def get_semantic_hierarchy_node(self, node_key: str) -> SemanticHierarchyNode | None:
+        """Return one semantic hierarchy node by deterministic key."""
+        ...
+
+    async def upsert_semantic_hierarchy_node(self, node: SemanticHierarchyNode) -> SemanticHierarchyNode:
+        """Insert or update one hierarchical semantic aggregate node."""
+        ...
+
+    async def search_semantic_hierarchy(
+        self, embedding: list[float], limit: int, threshold: float
+    ) -> list[SemanticHierarchyNode]:
+        """Search hierarchical semantic aggregates using cosine similarity."""
         ...
 
     async def search_procedural(
