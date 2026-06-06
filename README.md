@@ -15,14 +15,45 @@ stronger Critic or enable standalone Actor-Critic mode.
   hierarchy summaries, workflows, and failures.
 - Two-tool MCP workflow: retrieve context before answering, consolidate after
   answering.
-- Optional external-orchestrator workflow where Codex, Claude Code, or another
-  MCP client plans memory-layer tool calls directly.
+- External-orchestrator workflow where Codex, Claude Code, Cline, or another
+  MCP client can plan memory-layer tool calls directly.
 - Deterministic zero-key mode for local use.
 - Optional Anthropic, OpenAI, or Groq Critic for deeper evaluation.
 - SQLite by default, with PostgreSQL/pgvector support for larger deployments.
 - Hash embeddings for fast zero-dependency startup, or sentence-transformer
   embeddings for higher-quality retrieval.
 - Semantic fact governance: delete, pin, stale, export, and import memories.
+
+## Architecture
+
+Agentic Memory is an MCP-native memory substrate. In the default path, the
+assistant using the MCP server remains the Actor and retrieval orchestrator:
+Claude Code, Codex, Cline, or another client decides what context it needs,
+answers the user, and then asks Agentic Memory to consolidate the completed
+turn.
+
+```text
+MCP client (Codex / Claude Code / Cline)
+  -> get_session_context or retrieve_memory_layer
+  -> user-facing reasoning and tool use
+  -> consolidate_turn
+  -> Agentic Memory evaluates, stores, aggregates, and tunes retrieval
+```
+
+The codebase is split into these parts:
+
+| Area | Modules | Role |
+|---|---|---|
+| Adapter | `mcp_server.py`, `main.py` | Expose MCP tools and a small REST/debug API. |
+| Core | `core/memory_service.py`, `core/evaluation_service.py`, `core/models.py` | Build context, evaluate turns, consolidate memory, and define schemas. |
+| Planner | `planner/retrieval_planner.py` | Provide the quick-path heuristic retrieval planner and ranking. |
+| Store | `store/*` | Persist memory layers in SQLite or PostgreSQL/pgvector. |
+| Model | `model/*` | Provide embeddings and optional structured LLM clients for Critic/standalone mode. |
+| Runtime | `runtime/*` | Optional provider-backed standalone Actor-Critic loop and local tools. |
+
+No internal LLM provider is required for normal MCP retrieval orchestration.
+Provider-backed LLMs are only used when you enable an optional LLM Critic or
+standalone Actor-Critic mode.
 
 ## Memory Loop
 
@@ -69,15 +100,61 @@ completed turn
 
 ## Retrieval Orchestration
 
-The default quick path is still `get_session_context`, which uses the local
-heuristic planner plus vector search.
+There are two retrieval paths:
 
-For a CMA-style agentic retrieval loop, the LLM orchestrator is the MCP client
-itself: Codex, Claude Code, Cline, or another assistant. Call
-`get_memory_tool_manifest` to see the available memory tools, then call
-`retrieve_memory_layer` one or more times with refined queries across
-conversational, semantic, semantic hierarchy, episodic, procedural, and failure
-memory. No additional internal LLM provider is required for retrieval planning.
+1. `get_session_context` is the quick path. It uses the local heuristic planner
+   plus vector search to assemble conversational, semantic, semantic hierarchy,
+   episodic, procedural, and failure context.
+2. `get_memory_tool_manifest` plus `retrieve_memory_layer` is the agentic path.
+   The MCP client itself acts as the LLM orchestrator, deciding which memory
+   layers to query, in what order, and how to reconcile the returned signals.
+
+For a CMA-style retrieval loop, Codex or Claude Code can do this:
+
+```text
+user query
+  -> inspect available memory tools with get_memory_tool_manifest
+  -> query semantic_hierarchy for broad preferences and project context
+  -> query semantic for precise durable facts
+  -> query episodic for similar prior turns
+  -> query procedural for reusable workflows
+  -> query failure for known hazards
+  -> synthesize the final answer using only grounded memory
+```
+
+Simple queries can use one layer. More complex or longitudinal questions can
+trigger several `retrieve_memory_layer` calls with refined queries. Agentic
+Memory provides the memory tools and ranking; the MCP client provides the
+reasoning loop.
+
+## Semantic Hierarchy
+
+Flat semantic facts remain the canonical source of truth. The semantic
+hierarchy is a derived retrieval index built from those facts.
+
+Each saved or reinforced semantic fact updates:
+
+```text
+root
+  -> facet
+  -> facet summary
+  -> Q&A node
+```
+
+Hierarchy nodes are stored in `am_semantic_hierarchy_nodes` and represented by
+`SemanticHierarchyNode`. They include deterministic keys, parent links, facet
+names, source fact IDs, embeddings, confidence, and timestamps.
+
+| Node type | Purpose |
+|---|---|
+| `root` | Top-level index for semantic memory. |
+| `facet` | Groups facts into facets such as communication preferences, workflow preferences, project context, environment, and general knowledge. |
+| `summary` | Compact bottom-up summary for a facet. |
+| `qa` | Q&A-style retrieval node grounded in one or more semantic facts. |
+
+When semantic facts are deleted, pinned, marked stale, or imported through MCP
+management tools, the hierarchy is rebuilt from active semantic facts so stale
+derived content does not linger.
 
 ## Install
 
@@ -207,7 +284,7 @@ http://localhost:8001/sse
 
 This is the default mode. The external assistant is the Actor, and Agentic
 Memory uses deterministic evaluation for fact extraction, quality scoring,
-workflow detection, and failure recording.
+workflow detection, failure recording, and semantic hierarchy aggregation.
 
 ```bash
 .venv/bin/python mcp_server.py
@@ -216,7 +293,8 @@ workflow detection, and failure recording.
 ### MCP Mode With LLM Critic
 
 Set one provider to let an LLM Critic score the turn and extract richer
-semantic facts:
+semantic facts. Retrieval orchestration can still stay in Codex, Claude Code,
+or another MCP client:
 
 ```bash
 LLM_PROVIDER=anthropic ANTHROPIC_API_KEY=sk-ant-... .venv/bin/python mcp_server.py
