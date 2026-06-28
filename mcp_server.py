@@ -7,8 +7,8 @@ Workflow for AI agents:
     1. Call get_memory_tool_manifest() to inspect the retrieval contract
     2. Call retrieve_memory_layer() one or more times with your chosen layers
     3. Generate your response (the agent IS the actor and retrieval orchestrator)
-    4. Call consolidate_turn() after responding → the system automatically evaluates
-       quality, extracts facts, learns workflows, and records failures
+    4. Call consolidate_turn() after responding with mined facts and your score
+       -> if scoring was omitted, call rescore_episode() with your final score
 """
 
 from __future__ import annotations
@@ -27,7 +27,9 @@ from core.evaluation_service import AutoEvaluationService
 from core.memory_service import AgenticMemoryService
 from core.models import (
     ActorResult,
+    CriticEvaluation,
     MemoryLayer,
+    NewSemanticFact,
     SemanticMemoryRecord,
     ToolInvocation,
 )
@@ -123,6 +125,8 @@ async def consolidate_turn(
     assistant_response: str,
     tool_calls_json: str = "[]",
     new_facts: list[str] | None = None,
+    semantic_facts_json: str = "[]",
+    agent_evaluation_json: str = "",
     failure_summary: str | None = None,
     quality_score: float | None = None,
     reasoning_summary: str | None = None,
@@ -132,8 +136,8 @@ async def consolidate_turn(
     Call this AFTER responding to the user. The system will:
     - Save the conversation turn
     - Record the episode with tool usage patterns
-    - Auto-evaluate response quality using an LLM critic (if configured)
-    - Extract and deduplicate semantic facts (preferences, rules, inferred knowledge)
+    - Record response quality using the MCP client agent's typed score
+    - Save and deduplicate semantic facts mined by the MCP client agent
     - Learn reusable tool workflows from successful multi-step patterns
     - Record failures for future avoidance
 
@@ -143,11 +147,20 @@ async def consolidate_turn(
     - assistant_response: Your response text
     - tool_calls_json: JSON array of tool calls made (optional, default "[]")
       Each entry: {"tool_name": "...", "input_parameters": {...}, "success": true/false, ...}
-    - new_facts: Facts learned from this interaction (e.g. ["user prefers Python"])
+    - new_facts: Backward-compatible untyped fact strings learned by the MCP client agent.
+    - semantic_facts_json: JSON array of typed facts mined by the MCP client agent.
+      Each entry: {"fact_type": "preference|inferred_fact|system_rule", "content": "...",
+      "confidence": 0.0-1.0, "source": "user_stated|llm_inferred|tool_derived"}.
+    - agent_evaluation_json: Preferred typed scoring JSON produced by Codex,
+      Cline, Claude Code, or the MCP client agent. Uses CriticEvaluation fields:
+      factual_accuracy, preference_adherence, tool_efficiency,
+      hallucination_risk, workflow_quality, save_workflow, failure_summary.
+      If omitted, the server creates provisional scores so consolidation does
+      not fail, then returns needs_agent_rescore=true and an episode_id for
+      rescore_episode.
     - failure_summary: Description of any failures encountered
-    - quality_score: Optional self-assessed quality score from the AI agent (0-10).
-      When provided, this is used as the primary quality signal instead of heuristics.
-      The agent knows best how well it handled the request.
+    - quality_score: Deprecated optional agent self-score kept for compatibility.
+      Ignored when agent_evaluation_json is present.
     - reasoning_summary: Optional brief summary of the agent's internal reasoning
       or approach for this turn. Stored for episodic recall.
     """
@@ -158,6 +171,18 @@ async def consolidate_turn(
     if not isinstance(parsed_tool_calls, list):
         raise ValueError("tool_calls_json must decode to a JSON array")
     tool_calls = [ToolInvocation.model_validate(item) for item in parsed_tool_calls]
+    parsed_semantic_facts = json.loads(semantic_facts_json) if semantic_facts_json.strip() else []
+    if not isinstance(parsed_semantic_facts, list):
+        raise ValueError("semantic_facts_json must decode to a JSON array")
+    semantic_facts = [NewSemanticFact.model_validate(item) for item in parsed_semantic_facts]
+    parsed_agent_evaluation = json.loads(agent_evaluation_json) if agent_evaluation_json.strip() else None
+    if parsed_agent_evaluation is not None and not isinstance(parsed_agent_evaluation, dict):
+        raise ValueError("agent_evaluation_json must decode to a JSON object")
+    agent_evaluation = (
+        CriticEvaluation.model_validate(parsed_agent_evaluation)
+        if parsed_agent_evaluation is not None
+        else None
+    )
 
     # Build actor result (the AI agent IS the actor)
     actor_result = ActorResult(
@@ -166,22 +191,27 @@ async def consolidate_turn(
         reasoning=reasoning_summary or "",
     )
 
-    critic_evaluation = await components.evaluation_service.evaluate(
+    evaluation_result = await components.evaluation_service.evaluate_with_metadata(
         user_message=user_message,
         assistant_response=assistant_response,
         actor_result=actor_result,
         new_facts=new_facts,
+        semantic_facts=semantic_facts,
+        agent_evaluation=agent_evaluation,
         failure_summary=failure_summary,
         quality_score=quality_score,
     )
+    critic_evaluation = evaluation_result.evaluation
 
     # Consolidate into all memory layers
-    turn_index, writes, conflicts = await components.memory_service.consolidate(
+    turn_index, episode_id, writes, conflicts = await components.memory_service.consolidate(
         prompt=user_message,
         actor_result=actor_result,
         critic_evaluation=critic_evaluation,
         session_id=session_id,
         loop_latency_ms=0,
+        scoring_source=evaluation_result.scoring_source,
+        needs_agent_rescore=evaluation_result.needs_agent_rescore,
     )
 
     # Feed critic result back to the fallback planner for quick-path tuning.
@@ -191,10 +221,81 @@ async def consolidate_turn(
     return json.dumps(
         {
             "turn_index": turn_index,
+            "episode_id": episode_id,
             "critic_score": critic_evaluation.overall_score,
             "critic_passed": critic_evaluation.passed,
+            "scoring_source": evaluation_result.scoring_source,
+            "needs_agent_rescore": evaluation_result.needs_agent_rescore,
             "writes": writes,
             "semantic_conflicts": conflicts,
+        },
+        ensure_ascii=False,
+    )
+
+
+@mcp.tool()
+async def rescore_episode(
+    episode_id: str,
+    agent_evaluation_json: str,
+    session_id: str = "",
+) -> str:
+    """Replace a provisional episode score with the MCP client agent's final score.
+
+    Use this when consolidate_turn returned needs_agent_rescore=true. The score
+    must be produced by Codex, Cline, Claude Code, or the active MCP client agent,
+    not by a server-side assistant. This updates the existing episode instead of
+    creating a duplicate memory turn.
+
+    Parameters:
+    - episode_id: The episode_id returned by consolidate_turn.
+    - agent_evaluation_json: JSON object using CriticEvaluation fields:
+      factual_accuracy, preference_adherence, tool_efficiency,
+      hallucination_risk, workflow_quality, save_workflow, failure_summary.
+    - session_id: Optional session identifier for retrieval feedback tuning.
+    """
+    components = await _components()
+    parsed_agent_evaluation = json.loads(agent_evaluation_json) if agent_evaluation_json.strip() else None
+    if parsed_agent_evaluation is None or not isinstance(parsed_agent_evaluation, dict):
+        raise ValueError("agent_evaluation_json must decode to a JSON object")
+    agent_evaluation = CriticEvaluation.model_validate(parsed_agent_evaluation)
+
+    existing = await components.store.get_episode(episode_id)
+    if existing is None:
+        return json.dumps({"found": False, "episode_id": episode_id}, ensure_ascii=False)
+
+    actor_result = ActorResult(
+        reasoning=existing.reasoning_summary,
+        tool_calls=existing.tool_sequence,
+        final_response=existing.final_response,
+    )
+    evaluation_result = await components.evaluation_service.evaluate_with_metadata(
+        user_message=existing.prompt_text,
+        assistant_response=existing.final_response,
+        actor_result=actor_result,
+        agent_evaluation=agent_evaluation,
+        failure_summary=agent_evaluation.failure_summary,
+    )
+    updated_episode, writes = await components.memory_service.apply_episode_rescore(
+        episode_id=episode_id,
+        critic_evaluation=evaluation_result.evaluation,
+        scoring_source=evaluation_result.scoring_source,
+    )
+    if updated_episode is None:
+        return json.dumps({"found": False, "episode_id": episode_id}, ensure_ascii=False)
+
+    if session_id:
+        plan = await components.planner.plan(existing.prompt_text, session_id)
+        await components.planner.record_feedback(session_id, plan, evaluation_result.evaluation.passed)
+
+    return json.dumps(
+        {
+            "found": True,
+            "episode_id": episode_id,
+            "critic_score": evaluation_result.evaluation.overall_score,
+            "critic_passed": evaluation_result.evaluation.passed,
+            "scoring_source": evaluation_result.scoring_source,
+            "needs_agent_rescore": False,
+            "writes": writes,
         },
         ensure_ascii=False,
     )
@@ -459,6 +560,7 @@ async def _components() -> MCPComponents:
             embedding_model=embedding_model,
             memory_window_turns=settings.memory_window_turns,
             semantic_memory_ttl_days=settings.semantic_memory_ttl_days,
+            memory_mining_prompt=settings.memory_mining_prompt,
         )
         planner = HeuristicRetrievalPlanner(
             store=store,

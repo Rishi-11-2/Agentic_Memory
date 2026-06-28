@@ -74,7 +74,7 @@ class SelfLearningLoop:
             memory_writes = ["Skipped consolidation because Critic timed out"]
         else:
             total_latency_ms = int((perf_counter() - loop_started) * 1000)
-            turn_index, memory_writes, semantic_conflicts = await self._memory_service.consolidate(
+            turn_index, _episode_id, memory_writes, semantic_conflicts = await self._memory_service.consolidate(
                 prompt=user_message,
                 actor_result=actor_result,
                 critic_evaluation=critic_evaluation,

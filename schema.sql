@@ -37,11 +37,27 @@ create table if not exists am_episodic_memory (
     outcome text not null check (outcome in ('success', 'partial', 'failure')),
     error_trace text,
     latency_ms integer not null default 0 check (latency_ms >= 0),
+    evaluation_score double precision check (
+        evaluation_score is null or (evaluation_score >= 0.0 and evaluation_score <= 10.0)
+    ),
+    evaluation_source text,
+    needs_agent_rescore boolean not null default false,
+    evaluated_at timestamptz,
     timestamp timestamptz not null default now()
 );
 
 alter table am_episodic_memory
     add column if not exists reasoning_summary text not null default '';
+alter table am_episodic_memory
+    add column if not exists evaluation_score double precision check (
+        evaluation_score is null or (evaluation_score >= 0.0 and evaluation_score <= 10.0)
+    );
+alter table am_episodic_memory
+    add column if not exists evaluation_source text;
+alter table am_episodic_memory
+    add column if not exists needs_agent_rescore boolean not null default false;
+alter table am_episodic_memory
+    add column if not exists evaluated_at timestamptz;
 
 create table if not exists am_failure_episodes (
     failure_id uuid primary key default gen_random_uuid(),
@@ -244,6 +260,10 @@ returns table (
     outcome text,
     error_trace text,
     latency_ms integer,
+    evaluation_score double precision,
+    evaluation_source text,
+    needs_agent_rescore boolean,
+    evaluated_at timestamptz,
     timestamp timestamptz,
     similarity double precision
 )
@@ -258,6 +278,10 @@ as $$
         e.outcome,
         e.error_trace,
         e.latency_ms,
+        e.evaluation_score,
+        e.evaluation_source,
+        e.needs_agent_rescore,
+        e.evaluated_at,
         e.timestamp,
         1 - (e.prompt_embedding <=> $1) as similarity
     from am_episodic_memory e

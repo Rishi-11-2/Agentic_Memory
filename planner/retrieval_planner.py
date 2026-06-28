@@ -26,6 +26,15 @@ from model.embedding_model import EmbeddingModel
 from store.base import MemoryStore
 
 
+_DEFAULT_MEMORY_MINING_PROMPT = (
+    "After answering, review the user's message, the assistant response, tool outcomes, and recent "
+    "retrieved memory. Propose only durable memory that should help future turns. Infer implicit "
+    "preferences from repeated behavior, corrections, accepted workflows, rejected formats, and "
+    "stable project context. Do not save one-off task details, secrets, unsupported guesses, or "
+    "facts already contradicted by stronger memory. Prefer concise atomic facts."
+)
+
+
 class AgenticRetrievalOrchestrator:
     """Expose memory-layer tools for an MCP client agent to orchestrate.
 
@@ -40,12 +49,14 @@ class AgenticRetrievalOrchestrator:
         embedding_model: EmbeddingModel,
         memory_window_turns: int = 10,
         semantic_memory_ttl_days: int = 180,
+        memory_mining_prompt: str | None = None,
     ) -> None:
         """Create a client-orchestrated retrieval toolkit."""
         self._store = store
         self._embedding_model = embedding_model
         self._memory_window_turns = memory_window_turns
         self._semantic_memory_ttl_days = semantic_memory_ttl_days
+        self._memory_mining_prompt = memory_mining_prompt.strip() if memory_mining_prompt else ""
 
     def manifest(self) -> dict[str, Any]:
         """Describe the MCP-client orchestration contract and retrieval tools."""
@@ -57,14 +68,75 @@ class AgenticRetrievalOrchestrator:
                 "no_hidden_planner_llm": True,
                 "multi_hop_supported": True,
             },
+            "scoring": {
+                "owner": "mcp_client_agent",
+                "primary": "Codex, Claude Code, Cline, or the MCP client agent scores its completed turn.",
+                "server_bootstrap": (
+                    "If agent_evaluation_json is omitted, the server invents provisional scores only "
+                    "to keep consolidation alive."
+                ),
+                "rescore": (
+                    "When needs_agent_rescore is true, the MCP client should score the turn and call "
+                    "rescore_episode with the returned episode_id."
+                ),
+                "client_quality_score": "Deprecated compatibility field; use agent_evaluation_json instead.",
+                "returned_as": (
+                    "consolidate_turn and rescore_episode return scoring_source as mcp_client_agent "
+                    "or heuristic_provisional."
+                ),
+                "output_field": "agent_evaluation_json",
+                "output_schema": {
+                    "factual_accuracy": "0-10",
+                    "preference_adherence": "0-10",
+                    "tool_efficiency": "0-10",
+                    "hallucination_risk": "0-10, higher means better grounded and lower risk",
+                    "workflow_quality": "0-10",
+                    "save_workflow": "boolean",
+                    "failure_summary": "string or null",
+                },
+            },
             "recommended_flow": [
                 "Read the user query and decide which memory layers are relevant.",
                 "Call retrieve_memory_layer for one layer at a time, using refined queries when a result suggests a follow-up hop.",
                 "Prefer semantic_hierarchy for broad context, semantic for exact facts, procedural for reusable workflows, episodic for prior examples, and failure for known hazards.",
                 "Resolve conflicts by preferring explicit user-stated, high-confidence, pinned, and recent memories.",
                 "Synthesize only grounded memory into the final answer.",
-                "Call consolidate_turn after answering so the completed turn can be learned.",
+                "Mine durable preferences and facts, score the completed turn, then call consolidate_turn with semantic_facts_json and agent_evaluation_json.",
+                "If consolidate_turn reports needs_agent_rescore, call rescore_episode with the same episode_id and the MCP client agent score.",
             ],
+            "memory_mining": {
+                "orchestrator": "mcp_client_agent",
+                "prompt_name": "implicit_preference_mining",
+                "customizable": True,
+                "prompt": self._memory_mining_prompt or _DEFAULT_MEMORY_MINING_PROMPT,
+                "fact_types": {
+                    "preference": "User likes, dislikes, defaults, style/format choices, workflow choices, or behavioral patterns.",
+                    "system_rule": "Stable project, environment, repository, policy, or tool-use constraints.",
+                    "inferred_fact": "Other durable facts that are useful but are not preferences or rules.",
+                },
+                "source_guidance": {
+                    "user_stated": "Use only when the user explicitly stated the fact or preference.",
+                    "llm_inferred": "Use for implicit preference mining from behavior across turns.",
+                    "tool_derived": "Use when a tool result established the fact.",
+                },
+                "output_field": "semantic_facts_json",
+                "output_schema": [
+                    {
+                        "fact_type": "preference | inferred_fact | system_rule",
+                        "content": "Atomic durable memory fact.",
+                        "confidence": "0.0-1.0 confidence score.",
+                        "source": "user_stated | llm_inferred | tool_derived",
+                    }
+                ],
+                "example": [
+                    {
+                        "fact_type": "preference",
+                        "content": "User prefers concise implementation summaries with verification commands.",
+                        "confidence": 0.78,
+                        "source": "llm_inferred",
+                    }
+                ],
+            },
             "layers": {
                 MemoryLayer.CONVERSATIONAL.value: "Recent session messages and rolling summaries. Use for active-thread continuity.",
                 MemoryLayer.SEMANTIC.value: "Flat durable facts, preferences, and system rules. Use for precise known facts.",
@@ -92,10 +164,20 @@ class AgenticRetrievalOrchestrator:
                         "user_message": "The user's original message.",
                         "assistant_response": "The MCP client agent's final response.",
                         "tool_calls_json": "Optional JSON audit of tool calls made by the MCP client agent.",
-                        "new_facts": "Optional durable facts the MCP client agent wants to save.",
+                        "new_facts": "Backward-compatible untyped durable fact strings.",
+                        "semantic_facts_json": "Typed durable facts mined by the MCP client agent using the memory_mining prompt.",
+                        "agent_evaluation_json": "Typed 0-10 scoring produced by the MCP client agent.",
                         "failure_summary": "Optional summary of failures worth remembering.",
-                        "quality_score": "Optional self-assessed quality score from 0 to 10.",
+                        "quality_score": "Deprecated compatibility field; use agent_evaluation_json instead.",
                         "reasoning_summary": "Optional brief approach summary for episodic recall.",
+                    },
+                },
+                {
+                    "name": "rescore_episode",
+                    "arguments": {
+                        "episode_id": "Episode id returned by consolidate_turn.",
+                        "agent_evaluation_json": "Typed 0-10 scoring produced by the MCP client agent.",
+                        "session_id": "Optional session id for retrieval-feedback tuning.",
                     },
                 },
             ],
@@ -132,7 +214,7 @@ class AgenticRetrievalOrchestrator:
 
         embedding = await self._embedding_model.embed(query)
         if layer == MemoryLayer.SEMANTIC:
-            records = _rank_semantic_records(
+            semantic_records = _rank_semantic_records(
                 await self._store.search_semantic(
                     embedding,
                     limit,
@@ -141,18 +223,23 @@ class AgenticRetrievalOrchestrator:
                     last_confirmed_after=self._semantic_cutoff(),
                 )
             )[:limit]
+            serialized_records = [record.model_dump(mode="json") for record in semantic_records]
         elif layer == MemoryLayer.SEMANTIC_HIERARCHY:
-            records = _rank_semantic_hierarchy_records(
+            hierarchy_records = _rank_semantic_hierarchy_records(
                 await self._store.search_semantic_hierarchy(embedding, limit, 0.0)
             )[:limit]
+            serialized_records = [record.model_dump(mode="json") for record in hierarchy_records]
         elif layer == MemoryLayer.EPISODIC:
-            records = _rank_episodes(await self._store.search_episodes(embedding, limit, 0.0))[:limit]
+            episodic_records = _rank_episodes(await self._store.search_episodes(embedding, limit, 0.0))[:limit]
+            serialized_records = [record.model_dump(mode="json") for record in episodic_records]
         elif layer == MemoryLayer.PROCEDURAL:
             trigger_matches = await self._store.match_procedural_triggers(query, limit)
             vector_matches = await self._store.search_procedural(embedding, limit, 0.0)
-            records = _rank_workflows(_dedupe_workflows(trigger_matches + vector_matches))[:limit]
+            procedural_records = _rank_workflows(_dedupe_workflows(trigger_matches + vector_matches))[:limit]
+            serialized_records = [record.model_dump(mode="json") for record in procedural_records]
         elif layer == MemoryLayer.FAILURE:
-            records = _rank_failures(await self._store.search_failures(embedding, limit, 0.0))[:limit]
+            failure_records = _rank_failures(await self._store.search_failures(embedding, limit, 0.0))[:limit]
+            serialized_records = [record.model_dump(mode="json") for record in failure_records]
         else:
             raise ValueError(f"Unsupported memory layer: {layer.value}")
 
@@ -160,7 +247,7 @@ class AgenticRetrievalOrchestrator:
             "orchestrator": "mcp_client_agent",
             "layer": layer.value,
             "query": query,
-            "records": [record.model_dump(mode="json") for record in records],
+            "records": serialized_records,
         }
 
     def _semantic_cutoff(self) -> datetime | None:

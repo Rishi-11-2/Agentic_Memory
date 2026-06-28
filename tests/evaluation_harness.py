@@ -52,18 +52,96 @@ class AgenticMemoryHarness(unittest.IsolatedAsyncioTestCase):
         if os.path.exists(self.db_path):
             os.unlink(self.db_path)
 
-    async def test_heuristic_evaluator_extracts_preferences_and_facts(self) -> None:
+    async def test_evaluator_uses_agent_mined_semantic_facts(self) -> None:
         evaluator = AutoEvaluationService()
         evaluation = await evaluator.evaluate(
             user_message="I prefer concise answers. My project uses FastAPI.",
             assistant_response="Understood. I will keep answers concise.",
             actor_result=ActorResult(final_response="Understood. I will keep answers concise."),
-            quality_score=8.0,
+            semantic_facts=[
+                NewSemanticFact(
+                    fact_type=SemanticFactType.PREFERENCE,
+                    content="User preference: prefers concise answers.",
+                    confidence=0.9,
+                    source="user_stated",
+                ),
+                NewSemanticFact(
+                    fact_type=SemanticFactType.SYSTEM_RULE,
+                    content="Project context: the project uses FastAPI.",
+                    confidence=0.85,
+                    source="user_stated",
+                ),
+            ],
+            agent_evaluation=CriticEvaluation(
+                factual_accuracy=8,
+                preference_adherence=8,
+                tool_efficiency=8,
+                hallucination_risk=8,
+                workflow_quality=8,
+                save_workflow=False,
+            ),
+            quality_score=1.0,
         )
         contents = [fact.content for fact in evaluation.new_semantic_facts]
-        self.assertTrue(any("I prefer concise answers" in content for content in contents))
-        self.assertTrue(any("My project uses FastAPI" in content for content in contents))
+        self.assertTrue(any("concise answers" in content for content in contents))
+        self.assertTrue(any("FastAPI" in content for content in contents))
         self.assertGreaterEqual(evaluation.overall_score, 7.0)
+        self.assertTrue(evaluation.passed)
+
+        no_agent_facts = await evaluator.evaluate(
+            user_message="I prefer verbose answers. My project uses Django.",
+            assistant_response="Understood.",
+            actor_result=ActorResult(final_response="Understood."),
+            quality_score=8.0,
+        )
+        self.assertEqual(no_agent_facts.new_semantic_facts, [])
+        provisional_result = await evaluator.evaluate_with_metadata(
+            user_message="Summarize the change.",
+            assistant_response="Done with a clear summary.",
+            actor_result=ActorResult(final_response="Done with a clear summary."),
+            quality_score=1.0,
+        )
+        self.assertEqual(provisional_result.scoring_source, "heuristic_provisional")
+        self.assertTrue(provisional_result.needs_agent_rescore)
+        self.assertTrue(provisional_result.evaluation.passed)
+        self.assertFalse(provisional_result.evaluation.save_workflow)
+
+        agent_scored = await evaluator.evaluate_with_metadata(
+            user_message="Use whatever format seems best.",
+            assistant_response="Done.",
+            actor_result=ActorResult(final_response="Done."),
+            quality_score=1.0,
+            agent_evaluation=CriticEvaluation(
+                factual_accuracy=8,
+                preference_adherence=8,
+                tool_efficiency=8,
+                hallucination_risk=8,
+                workflow_quality=8,
+                save_workflow=False,
+                new_semantic_facts=[
+                    NewSemanticFact(
+                        fact_type=SemanticFactType.PREFERENCE,
+                        content="Embedded evaluation fact should not be saved.",
+                        confidence=0.9,
+                        source="llm_inferred",
+                    )
+                ],
+            ),
+            semantic_facts=[
+                NewSemanticFact(
+                    fact_type=SemanticFactType.PREFERENCE,
+                    content="User prefers verification commands when code changes are made.",
+                    confidence=0.74,
+                    source="llm_inferred",
+                )
+            ],
+        )
+        self.assertEqual(agent_scored.scoring_source, "mcp_client_agent")
+        self.assertFalse(agent_scored.needs_agent_rescore)
+        agent_contents = [fact.content for fact in agent_scored.evaluation.new_semantic_facts]
+        self.assertNotIn("Embedded evaluation fact should not be saved.", agent_contents)
+        self.assertIn("User prefers verification commands when code changes are made.", agent_contents)
+        self.assertEqual(agent_scored.evaluation.overall_score, 8.0)
 
     async def test_semantic_dedup_and_pin_stale_management(self) -> None:
         evaluation = CriticEvaluation(
@@ -150,7 +228,21 @@ class AgenticMemoryHarness(unittest.IsolatedAsyncioTestCase):
         manifest = self.orchestrator.manifest()
         self.assertEqual(manifest["orchestrator"], "mcp_client_agent")
         self.assertTrue(manifest["agentic_contract"]["no_hidden_planner_llm"])
+        self.assertEqual(manifest["scoring"]["owner"], "mcp_client_agent")
+        self.assertIn("scoring_source", manifest["scoring"]["returned_as"])
         self.assertFalse(manifest["fallback"]["agentic"])
+        self.assertEqual(manifest["memory_mining"]["orchestrator"], "mcp_client_agent")
+        self.assertEqual(manifest["memory_mining"]["output_field"], "semantic_facts_json")
+        tool_names = {tool["name"] for tool in manifest["tools"]}
+        self.assertIn("rescore_episode", tool_names)
+        custom_prompt = "Mine only durable coding workflow preferences."
+        custom_orchestrator = AgenticRetrievalOrchestrator(
+            self.store,
+            self.embedding,
+            memory_window_turns=3,
+            memory_mining_prompt=custom_prompt,
+        )
+        self.assertEqual(custom_orchestrator.manifest()["memory_mining"]["prompt"], custom_prompt)
 
         record = SemanticMemoryRecord(
             fact_type=SemanticFactType.PREFERENCE,
@@ -169,6 +261,50 @@ class AgenticMemoryHarness(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["orchestrator"], "mcp_client_agent")
         self.assertEqual(result["layer"], MemoryLayer.SEMANTIC.value)
         self.assertTrue(any("bullet lists" in item["content"] for item in result["records"]))
+
+    async def test_provisional_episode_can_be_rescored_by_mcp_client_agent(self) -> None:
+        evaluator = AutoEvaluationService()
+        tool_calls = [
+            ToolInvocation(tool_name="document_search", success=True),
+            ToolInvocation(tool_name="shell_executor", success=True),
+        ]
+        actor_result = ActorResult(tool_calls=tool_calls, final_response="Implemented and verified.")
+        provisional = await evaluator.evaluate_with_metadata(
+            user_message="Make the change and test it.",
+            assistant_response="Implemented and verified.",
+            actor_result=actor_result,
+        )
+        turn_index, episode_id, _, _ = await self.service.consolidate(
+            prompt="Make the change and test it.",
+            actor_result=actor_result,
+            critic_evaluation=provisional.evaluation,
+            session_id="rescore",
+            loop_latency_ms=12,
+            scoring_source=provisional.scoring_source,
+            needs_agent_rescore=provisional.needs_agent_rescore,
+        )
+        self.assertEqual(turn_index, 0)
+        stored = await self.store.get_episode(episode_id)
+        assert stored is not None
+        self.assertEqual(stored.evaluation_source, "heuristic_provisional")
+        self.assertTrue(stored.needs_agent_rescore)
+        self.assertEqual(await self.store.count_layer(MemoryLayer.PROCEDURAL), 0)
+
+        final_score = CriticEvaluation(
+            factual_accuracy=9,
+            preference_adherence=8,
+            tool_efficiency=9,
+            hallucination_risk=8,
+            workflow_quality=9,
+            save_workflow=True,
+        )
+        updated, writes = await self.service.apply_episode_rescore(episode_id, final_score)
+        assert updated is not None
+        self.assertEqual(updated.evaluation_source, "mcp_client_agent")
+        self.assertFalse(updated.needs_agent_rescore)
+        self.assertEqual(updated.evaluation_score, final_score.overall_score)
+        self.assertTrue(any("Updated episodic episode evaluation" in write for write in writes))
+        self.assertGreaterEqual(await self.store.count_layer(MemoryLayer.PROCEDURAL), 1)
 
     async def test_context_renders_multiple_workflows_and_known_facts(self) -> None:
         workflows = [
@@ -229,7 +365,7 @@ class AgenticMemoryHarness(unittest.IsolatedAsyncioTestCase):
             workflow_quality=2,
             failure_summary="Shell command failed.",
         )
-        turn_index, _, _ = await self.service.consolidate(
+        turn_index, _, _, _ = await self.service.consolidate(
             prompt="run a risky command",
             actor_result=ActorResult(tool_calls=[tool], final_response="It failed."),
             critic_evaluation=evaluation,

@@ -185,12 +185,14 @@ class PostgresMemoryStore(MemoryStore):
         async with self._pool.acquire() as conn:
             await conn.execute(
                 f"INSERT INTO am_episodic_memory (episode_id, prompt_text, reasoning_summary, {vec_col}, tool_sequence, "
-                "final_response, outcome, error_trace, latency_ms, timestamp) "
-                f"VALUES ($1, $2, $3, $4::vector, $5::jsonb, $6, $7, $8, $9, $10)",
+                "final_response, outcome, error_trace, latency_ms, evaluation_score, evaluation_source, "
+                "needs_agent_rescore, evaluated_at, timestamp) "
+                f"VALUES ($1, $2, $3, $4::vector, $5::jsonb, $6, $7, $8, $9, $10, $11, $12, $13, $14)",
                 episode.episode_id, episode.prompt_text,
                 episode.reasoning_summary, _vec_literal(vec_val), tool_seq,
                 episode.final_response, episode.outcome.value, episode.error_trace,
-                episode.latency_ms, episode.timestamp,
+                episode.latency_ms, episode.evaluation_score, episode.evaluation_source,
+                episode.needs_agent_rescore, episode.evaluated_at, episode.timestamp,
             )
         return episode
 
@@ -221,6 +223,32 @@ class PostgresMemoryStore(MemoryStore):
             row = await conn.fetchrow(
                 "SELECT * FROM am_episodic_memory WHERE episode_id = $1",
                 episode_id,
+            )
+        return self._episode_from_row(row) if row is not None else None
+
+    async def update_episode_evaluation(
+        self,
+        episode_id: str,
+        *,
+        evaluation_score: float,
+        evaluation_source: str,
+        needs_agent_rescore: bool,
+        outcome: EpisodeOutcome,
+        error_trace: str | None = None,
+    ) -> EpisodeRecord | None:
+        """Update the durable quality evaluation for an existing episode."""
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "UPDATE am_episodic_memory SET evaluation_score = $2, evaluation_source = $3, "
+                "needs_agent_rescore = $4, evaluated_at = $5, outcome = $6, error_trace = $7 "
+                "WHERE episode_id = $1 RETURNING *",
+                episode_id,
+                max(0.0, min(10.0, evaluation_score)),
+                evaluation_source,
+                needs_agent_rescore,
+                utc_now(),
+                outcome.value,
+                error_trace,
             )
         return self._episode_from_row(row) if row is not None else None
 
@@ -702,6 +730,12 @@ class PostgresMemoryStore(MemoryStore):
             error_trace=cast(str | None, row.get("error_trace")),
             latency_ms=int(row.get("latency_ms") or 0),
             timestamp=row.get("timestamp") or utc_now(),
+            evaluation_score=(
+                float(row.get("evaluation_score")) if row.get("evaluation_score") is not None else None
+            ),
+            evaluation_source=cast(str | None, row.get("evaluation_source")),
+            needs_agent_rescore=bool(row.get("needs_agent_rescore") or False),
+            evaluated_at=cast(datetime | None, row.get("evaluated_at")),
             score=_clip_similarity(row.get("similarity")),
         )
 
@@ -825,6 +859,23 @@ async def _migrate_schema(conn: asyncpg.Connection) -> None:
     await conn.execute(
         "ALTER TABLE IF EXISTS am_episodic_memory "
         "ADD COLUMN IF NOT EXISTS reasoning_summary text NOT NULL DEFAULT ''"
+    )
+    await conn.execute(
+        "ALTER TABLE IF EXISTS am_episodic_memory "
+        "ADD COLUMN IF NOT EXISTS evaluation_score double precision "
+        "CHECK (evaluation_score IS NULL OR (evaluation_score >= 0.0 AND evaluation_score <= 10.0))"
+    )
+    await conn.execute(
+        "ALTER TABLE IF EXISTS am_episodic_memory "
+        "ADD COLUMN IF NOT EXISTS evaluation_source text"
+    )
+    await conn.execute(
+        "ALTER TABLE IF EXISTS am_episodic_memory "
+        "ADD COLUMN IF NOT EXISTS needs_agent_rescore boolean NOT NULL DEFAULT false"
+    )
+    await conn.execute(
+        "ALTER TABLE IF EXISTS am_episodic_memory "
+        "ADD COLUMN IF NOT EXISTS evaluated_at timestamptz"
     )
     await conn.execute(
         "ALTER TABLE IF EXISTS am_semantic_memory "

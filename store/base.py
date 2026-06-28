@@ -8,6 +8,7 @@ from typing import Protocol
 from core.models import (
     ConversationalSummary,
     ConversationalTurnRecord,
+    EpisodeOutcome,
     EpisodeRecord,
     FailureEpisode,
     MemoryLayer,
@@ -76,6 +77,19 @@ class MemoryStore(Protocol):
 
     async def get_episode(self, episode_id: str) -> EpisodeRecord | None:
         """Return one episodic memory record by id."""
+        ...
+
+    async def update_episode_evaluation(
+        self,
+        episode_id: str,
+        *,
+        evaluation_score: float,
+        evaluation_source: str,
+        needs_agent_rescore: bool,
+        outcome: EpisodeOutcome,
+        error_trace: str | None = None,
+    ) -> EpisodeRecord | None:
+        """Update the durable quality evaluation for an existing episode."""
         ...
 
     async def search_episodes(

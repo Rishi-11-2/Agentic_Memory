@@ -185,7 +185,9 @@ class AgenticMemoryService:
         critic_evaluation: CriticEvaluation,
         session_id: str,
         loop_latency_ms: int,
-    ) -> tuple[int, list[str], list[str]]:
+        scoring_source: str = "server_critic",
+        needs_agent_rescore: bool = False,
+    ) -> tuple[int, str, list[str], list[str]]:
         """Write lessons from one loop turn into conversational, episodic, semantic, and procedural memory."""
         turn_index = await self._store.next_turn_index(session_id)
         writes: list[str] = []
@@ -207,6 +209,10 @@ class AgenticMemoryService:
             outcome=outcome,
             error_trace=_combined_error_trace(actor_result.tool_calls, critic_evaluation.failure_summary),
             latency_ms=loop_latency_ms,
+            evaluation_score=critic_evaluation.overall_score,
+            evaluation_source=scoring_source,
+            needs_agent_rescore=needs_agent_rescore,
+            evaluated_at=utc_now(),
         )
         saved_episode = await self._store.save_episode(episode)
         writes.append("Saved 1 episodic episode")
@@ -233,7 +239,52 @@ class AgenticMemoryService:
         if failures:
             writes.append(f"Saved {failures} failure episode{'s' if failures != 1 else ''}")
 
-        return turn_index, writes, semantic_conflicts
+        return turn_index, saved_episode.episode_id, writes, semantic_conflicts
+
+    async def apply_episode_rescore(
+        self,
+        episode_id: str,
+        critic_evaluation: CriticEvaluation,
+        scoring_source: str = "mcp_client_agent",
+    ) -> tuple[EpisodeRecord | None, list[str]]:
+        """Apply an MCP-client agent score to an existing provisionally scored episode."""
+        existing = await self._store.get_episode(episode_id)
+        if existing is None:
+            return None, []
+
+        actor_result = ActorResult(
+            reasoning=existing.reasoning_summary,
+            tool_calls=existing.tool_sequence,
+            final_response=existing.final_response,
+        )
+        outcome = _episode_outcome(actor_result.tool_calls, critic_evaluation)
+        error_trace = _combined_error_trace(actor_result.tool_calls, critic_evaluation.failure_summary)
+        updated = await self._store.update_episode_evaluation(
+            episode_id,
+            evaluation_score=critic_evaluation.overall_score,
+            evaluation_source=scoring_source,
+            needs_agent_rescore=False,
+            outcome=outcome,
+            error_trace=error_trace,
+        )
+        if updated is None:
+            return None, []
+        writes = ["Updated episodic episode evaluation"]
+
+        should_apply_deferred_learning = (
+            existing.needs_agent_rescore or existing.evaluation_source == "heuristic_provisional"
+        )
+        if should_apply_deferred_learning:
+            workflow = await self._consolidate_workflow(
+                existing.prompt_text,
+                actor_result,
+                critic_evaluation,
+            )
+            if workflow is not None:
+                writes.append(
+                    f"Saved procedural workflow ({workflow.status.value}, success_count={workflow.success_count})"
+                )
+        return updated, writes
 
     async def _maybe_roll_summary(
         self, session_id: str, turn_index: int

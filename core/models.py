@@ -127,6 +127,10 @@ class EpisodeRecord(BaseModel):
     error_trace: str | None = None
     latency_ms: int = Field(default=0, ge=0)
     timestamp: datetime = Field(default_factory=utc_now)
+    evaluation_score: float | None = Field(default=None, ge=0.0, le=10.0)
+    evaluation_source: str | None = None
+    needs_agent_rescore: bool = False
+    evaluated_at: datetime | None = None
     score: float | None = Field(default=None, ge=0.0, le=1.0)
 
     @property

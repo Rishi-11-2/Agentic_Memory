@@ -32,7 +32,33 @@ Standalone mode is optional and requires an LLM provider. In this mode the proje
 
 ## Evaluation
 
-`core/evaluation_service.py` owns turn evaluation. It can call an LLM Critic when one is configured, or use deterministic heuristics when no provider exists. Keeping this outside `mcp_server.py` lets MCP, HTTP, tests, and standalone flows share evaluation behavior.
+`core/evaluation_service.py` owns turn evaluation plumbing. In normal MCP mode,
+the MCP client agent scores its completed answer and passes that typed score as
+`agent_evaluation_json`. If the client omits the score, the server creates
+temporary provisional scores so consolidation does not fail, returns
+`needs_agent_rescore=true` plus `episode_id`, and expects the client to call
+`rescore_episode(episode_id, agent_evaluation_json)` with the proper agent
+score. The callback updates the same episodic record instead of creating a
+duplicate turn. `consolidate_turn` and `rescore_episode` return
+`scoring_source` so callers can tell whether the score came from
+`mcp_client_agent` or `heuristic_provisional`.
+
+In normal MCP mode, implicit preference mining belongs to the MCP client agent,
+not to local English regexes in the server. `get_memory_tool_manifest` includes
+a customizable `memory_mining` prompt that Codex, Claude Code, Cline, or another
+client agent can use after a turn. The client reviews user behavior, corrections,
+accepted workflows, rejected formats, tool outcomes, and retrieved memory, then
+passes typed facts through `consolidate_turn(..., semantic_facts_json=...)`.
+The deterministic evaluator packages those agent-mined facts into
+`CriticEvaluation.new_semantic_facts`; it does not infer preferences from
+hardcoded text patterns. `MEMORY_MINING_PROMPT` can override the default
+manifest prompt without moving mining back into the server.
+
+Provisional scoring is deliberately not authoritative. When it is used, the
+episode is marked with `evaluation_source="heuristic_provisional"` and
+`needs_agent_rescore=true`; deferred learning that depends on a trusted score,
+such as saving a successful procedural workflow, is applied only after the MCP
+client agent calls `rescore_episode`.
 
 ## Retrieval
 

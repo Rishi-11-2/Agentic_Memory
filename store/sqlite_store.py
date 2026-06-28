@@ -65,6 +65,10 @@ CREATE TABLE IF NOT EXISTS am_episodic_memory (
     outcome TEXT NOT NULL CHECK (outcome IN ('success', 'partial', 'failure')),
     error_trace TEXT,
     latency_ms INTEGER NOT NULL DEFAULT 0,
+    evaluation_score REAL CHECK (evaluation_score IS NULL OR (evaluation_score >= 0.0 AND evaluation_score <= 10.0)),
+    evaluation_source TEXT,
+    needs_agent_rescore INTEGER NOT NULL DEFAULT 0,
+    evaluated_at TEXT,
     timestamp TEXT NOT NULL
 );
 
@@ -277,14 +281,18 @@ class SQLiteMemoryStore(MemoryStore):
         """Persist an append-only episodic memory record."""
         await self._db.execute(
             "INSERT INTO am_episodic_memory (episode_id, prompt_text, reasoning_summary, prompt_embedding, "
-            "tool_sequence, final_response, outcome, error_trace, latency_ms, timestamp) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "tool_sequence, final_response, outcome, error_trace, latency_ms, evaluation_score, "
+            "evaluation_source, needs_agent_rescore, evaluated_at, timestamp) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (episode.episode_id, episode.prompt_text,
              episode.reasoning_summary,
              json.dumps(episode.prompt_embedding) if episode.prompt_embedding else None,
              json.dumps([tool.model_dump(mode="json") for tool in episode.tool_sequence]),
              episode.final_response, episode.outcome.value, episode.error_trace,
-             episode.latency_ms, episode.timestamp.isoformat()),
+             episode.latency_ms, episode.evaluation_score, episode.evaluation_source,
+             1 if episode.needs_agent_rescore else 0,
+             episode.evaluated_at.isoformat() if episode.evaluated_at else None,
+             episode.timestamp.isoformat()),
         )
         await self._db.commit()
         return episode
@@ -306,6 +314,37 @@ class SQLiteMemoryStore(MemoryStore):
         )
         row = await cursor.fetchone()
         return self._episode_from_row(row) if row is not None else None
+
+    async def update_episode_evaluation(
+        self,
+        episode_id: str,
+        *,
+        evaluation_score: float,
+        evaluation_source: str,
+        needs_agent_rescore: bool,
+        outcome: EpisodeOutcome,
+        error_trace: str | None = None,
+    ) -> EpisodeRecord | None:
+        """Update the durable quality evaluation for an existing episode."""
+        evaluated_at = utc_now()
+        cursor = await self._db.execute(
+            "UPDATE am_episodic_memory SET evaluation_score = ?, evaluation_source = ?, "
+            "needs_agent_rescore = ?, evaluated_at = ?, outcome = ?, error_trace = ? "
+            "WHERE episode_id = ?",
+            (
+                max(0.0, min(10.0, evaluation_score)),
+                evaluation_source,
+                1 if needs_agent_rescore else 0,
+                evaluated_at.isoformat(),
+                outcome.value,
+                error_trace,
+                episode_id,
+            ),
+        )
+        await self._db.commit()
+        if cursor.rowcount == 0:
+            return None
+        return await self.get_episode(episode_id)
 
     # ── Failure ─────────────────────────────────────────────────────
 
@@ -743,6 +782,12 @@ class SQLiteMemoryStore(MemoryStore):
             error_trace=cast(str | None, row["error_trace"]),
             latency_ms=int(row["latency_ms"] or 0),
             timestamp=row["timestamp"] or utc_now(),
+            evaluation_score=(
+                float(row["evaluation_score"]) if row["evaluation_score"] is not None else None
+            ),
+            evaluation_source=cast(str | None, row["evaluation_source"]),
+            needs_agent_rescore=bool(row["needs_agent_rescore"]),
+            evaluated_at=cast(datetime | None, row["evaluated_at"]),
             score=similarity,
         )
 
@@ -833,6 +878,19 @@ async def _migrate_schema(db: aiosqlite.Connection) -> None:
         await db.execute(
             "ALTER TABLE am_episodic_memory ADD COLUMN reasoning_summary TEXT NOT NULL DEFAULT ''"
         )
+    if "evaluation_score" not in episode_columns:
+        await db.execute(
+            "ALTER TABLE am_episodic_memory ADD COLUMN evaluation_score REAL "
+            "CHECK (evaluation_score IS NULL OR (evaluation_score >= 0.0 AND evaluation_score <= 10.0))"
+        )
+    if "evaluation_source" not in episode_columns:
+        await db.execute("ALTER TABLE am_episodic_memory ADD COLUMN evaluation_source TEXT")
+    if "needs_agent_rescore" not in episode_columns:
+        await db.execute(
+            "ALTER TABLE am_episodic_memory ADD COLUMN needs_agent_rescore INTEGER NOT NULL DEFAULT 0"
+        )
+    if "evaluated_at" not in episode_columns:
+        await db.execute("ALTER TABLE am_episodic_memory ADD COLUMN evaluated_at TEXT")
 
     cursor = await db.execute("PRAGMA table_info(am_semantic_memory)")
     columns = {str(row["name"]) for row in await cursor.fetchall()}

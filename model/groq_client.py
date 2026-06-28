@@ -10,7 +10,7 @@ from typing import Any, Protocol, TypeVar, cast
 
 from pydantic import BaseModel
 
-from core.models import ActorLLMOutput, CriticEvaluation, LLMMessage, NewSemanticFact, SemanticFactType, ToolInvocation
+from core.models import ActorLLMOutput, CriticEvaluation, LLMMessage, ToolInvocation
 ModelT = TypeVar("ModelT", bound=BaseModel)
 logger = logging.getLogger(__name__)
 
@@ -176,26 +176,19 @@ class DeterministicStructuredClient:
         )
 
     def _critic_output(self, prompt: str) -> CriticEvaluation:
-        """Create a deterministic critic result that can exercise consolidation."""
-        facts: list[NewSemanticFact] = []
-        user_prompt = _extract_user_prompt(prompt)
-        lowered = user_prompt.lower()
-        if any(marker in lowered for marker in ("i prefer", "always", "never", "please don't")):
-            facts.append(
-                NewSemanticFact(
-                    fact_type=SemanticFactType.PREFERENCE,
-                    content=f"User preference observed: {user_prompt[:180]}",
-                    confidence=0.82,
-                    source="user_stated",
-                )
-            )
+        """Create a deterministic critic result that can exercise consolidation.
+
+        Preference mining is intentionally left to the MCP client agent or a real
+        LLM Critic; this offline client only supplies stable scoring signals.
+        """
+        del prompt
         return CriticEvaluation(
             factual_accuracy=8.0,
             preference_adherence=8.0,
             tool_efficiency=8.0,
             hallucination_risk=8.0,
             workflow_quality=8.0,
-            new_semantic_facts=facts,
+            new_semantic_facts=[],
             save_workflow=True,
             failure_summary=None,
         )
@@ -231,12 +224,3 @@ def _extract_expression(prompt: str) -> str | None:
         return None
     expression: str = max(candidates, key=len).strip()
     return expression
-
-
-def _extract_user_prompt(evaluation_prompt: str) -> str:
-    """Extract the USER_PROMPT block from a deterministic Critic evaluation prompt."""
-    marker = "USER_PROMPT:\n"
-    if marker not in evaluation_prompt:
-        return evaluation_prompt
-    remainder = evaluation_prompt.split(marker, 1)[1]
-    return remainder.split("\n\n", 1)[0]

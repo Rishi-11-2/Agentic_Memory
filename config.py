@@ -100,6 +100,7 @@ class Settings(BaseSettings):
     semantic_dedup_threshold: float = Field(0.92, ge=0.0, le=1.0, alias="SEMANTIC_DEDUP_THRESHOLD")
     semantic_memory_ttl_days: int = Field(180, ge=0, alias="SEMANTIC_MEMORY_TTL_DAYS")
     failure_similarity_threshold: float = Field(0.80, ge=0.0, le=1.0, alias="FAILURE_SIMILARITY_THRESHOLD")
+    memory_mining_prompt: str = Field("", alias="MEMORY_MINING_PROMPT")
     log_level: str = Field("INFO", alias="LOG_LEVEL")
 
     # ── Tool Settings ───────────────────────────────────────────────
