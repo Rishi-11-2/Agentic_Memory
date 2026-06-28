@@ -4,9 +4,10 @@ This is the primary interface for AI coding agents (Claude Code, Codex, etc.)
 to interact with persistent multi-layer memory via the Model Context Protocol.
 
 Workflow for AI agents:
-    1. Call get_session_context() before generating a response → get relevant memories
-    2. Generate your response (the agent IS the actor)
-    3. Call consolidate_turn() after responding → the system automatically evaluates
+    1. Call get_memory_tool_manifest() to inspect the retrieval contract
+    2. Call retrieve_memory_layer() one or more times with your chosen layers
+    3. Generate your response (the agent IS the actor and retrieval orchestrator)
+    4. Call consolidate_turn() after responding → the system automatically evaluates
        quality, extracts facts, learns workflows, and records failures
 """
 
@@ -31,7 +32,7 @@ from core.models import (
     ToolInvocation,
 )
 from model.embedding_model import EmbeddingModel, create_embedding_model
-from planner.retrieval_planner import HeuristicRetrievalPlanner
+from planner.retrieval_planner import AgenticRetrievalOrchestrator, HeuristicRetrievalPlanner
 from store.base import MemoryStore
 from store.factory import create_memory_store
 
@@ -49,6 +50,7 @@ class MCPComponents:
     settings: Settings
     store: MemoryStore
     embedding_model: EmbeddingModel
+    retrieval_orchestrator: AgenticRetrievalOrchestrator
     planner: HeuristicRetrievalPlanner
     memory_service: AgenticMemoryService
     evaluation_service: AutoEvaluationService
@@ -61,45 +63,14 @@ class MCPComponents:
 
 @mcp.tool()
 async def get_memory_tool_manifest() -> str:
-    """Describe memory-layer tools for an external LLM retrieval orchestrator.
+    """Describe memory-layer tools for MCP-client agentic orchestration.
 
-    Codex, Claude Code, Cline, or another MCP client can use this manifest to
-    decide which memory layers to query and in what order. This keeps the LLM
-    orchestration in the client while Agentic Memory provides durable tools.
+    Codex, Claude Code, Cline, or another MCP client is the orchestrator: it
+    decides which layers to query, performs multi-hop retrieval, and synthesizes
+    grounded context. Agentic Memory only exposes durable retrieval tools.
     """
-    return json.dumps(
-        {
-            "orchestrator": "external_mcp_client",
-            "recommended_flow": [
-                "Read the user query and decide which memory layers are relevant.",
-                "Call retrieve_memory_layer one or more times with refined queries.",
-                "Resolve conflicts by preferring explicit user-stated, high-confidence, and recent memories.",
-                "Synthesize only grounded context into the final answer.",
-                "Call consolidate_turn after answering so new signals are learned.",
-            ],
-            "layers": {
-                "conversational": "Recent session messages and rolling summaries. Use for active-thread continuity.",
-                "semantic": "Flat durable facts, preferences, and system rules. Use for precise known facts.",
-                "semantic_hierarchy": (
-                    "Aggregated semantic facets, summaries, and Q&A nodes. Use for broader preference/context questions."
-                ),
-                "episodic": "Similar completed turns with prompt, outcome, tools, and response. Use for prior examples.",
-                "procedural": "Reusable successful tool workflows. Use for multi-step implementation or analysis tasks.",
-                "failure": "Similar past tool failures. Use for cautions and known bad approaches.",
-            },
-            "tool": {
-                "name": "retrieve_memory_layer",
-                "arguments": {
-                    "query": "Natural language retrieval query.",
-                    "layer": "conversational | semantic | semantic_hierarchy | episodic | procedural | failure",
-                    "session_id": "Required for conversational lookup; optional otherwise.",
-                    "top_k": "Maximum records to return.",
-                },
-            },
-            "quick_path": "get_session_context still provides the automatic heuristic retrieval path.",
-        },
-        ensure_ascii=False,
-    )
+    components = await _components()
+    return json.dumps(components.retrieval_orchestrator.manifest(), ensure_ascii=False)
 
 
 @mcp.tool()
@@ -107,11 +78,11 @@ async def get_session_context(
     user_message: str,
     session_id: str,
 ) -> str:
-    """Build a memory-enriched context prompt before generating a response.
+    """Build a fallback memory-enriched context prompt before responding.
 
-    Call this BEFORE responding to the user. Returns a structured text block
-    containing relevant system rules, user preferences, suggested workflows,
-    recent conversation history, and similar past episodes.
+    This is the backward-compatible convenience path. For CMA-style agentic
+    retrieval, prefer get_memory_tool_manifest plus repeated retrieve_memory_layer
+    calls so the MCP client agent chooses layers and multi-hop queries itself.
 
     Inject the returned text into your system prompt or context window to make
     your response informed by persistent memory.
@@ -129,64 +100,20 @@ async def retrieve_memory_layer(
     session_id: str = "",
     top_k: int = 5,
 ) -> str:
-    """Retrieve one memory layer for external LLM orchestration.
+    """Retrieve one memory layer selected by the MCP client orchestrator.
 
-    This is the granular alternative to get_session_context. An MCP client such
-    as Codex or Claude Code can call it repeatedly to build its own retrieval
-    plan across memory tools.
+    Codex, Claude Code, Cline, or another MCP client should call this repeatedly
+    with refined queries when it needs multi-hop retrieval. The server does not
+    use a hidden planner LLM.
     """
     components = await _components()
-    limit = max(1, min(int(top_k), 25))
-    embedding = await components.embedding_model.embed(query)
-
-    if layer == "conversational":
-        if not session_id:
-            raise ValueError("session_id is required for conversational retrieval")
-        summaries = await components.store.recent_summaries(session_id, min(2, limit))
-        records = await components.store.recent_conversation(session_id, limit)
-        return json.dumps(
-            {
-                "layer": layer,
-                "summaries": [summary.model_dump(mode="json") for summary in summaries],
-                "records": [record.model_dump(mode="json") for record in records],
-            },
-            ensure_ascii=False,
-        )
-    if layer == "semantic":
-        records = await components.store.search_semantic(
-            embedding,
-            limit,
-            0.0,
-            0.0,
-            last_confirmed_after=components.memory_service.semantic_cutoff(),
-        )
-    elif layer == "semantic_hierarchy":
-        records = await components.store.search_semantic_hierarchy(embedding, limit, 0.0)
-    elif layer == "episodic":
-        records = await components.store.search_episodes(embedding, limit, 0.0)
-    elif layer == "procedural":
-        trigger_matches = await components.store.match_procedural_triggers(query, limit)
-        vector_matches = await components.store.search_procedural(embedding, limit, 0.0)
-        seen: set[str] = set()
-        records = []
-        for record in trigger_matches + vector_matches:
-            if record.workflow_id in seen:
-                continue
-            seen.add(record.workflow_id)
-            records.append(record)
-            if len(records) >= limit:
-                break
-    else:
-        records = await components.store.search_failures(embedding, limit, 0.0)
-
-    return json.dumps(
-        {
-            "layer": layer,
-            "query": query,
-            "records": [record.model_dump(mode="json") for record in records],
-        },
-        ensure_ascii=False,
+    payload = await components.retrieval_orchestrator.retrieve_layer(
+        query=query,
+        layer=MemoryLayer(layer),
+        session_id=session_id,
+        top_k=top_k,
     )
+    return json.dumps(payload, ensure_ascii=False)
 
 
 @mcp.tool()
@@ -257,7 +184,7 @@ async def consolidate_turn(
         loop_latency_ms=0,
     )
 
-    # Feed critic result back to planner for retrieval weight tuning
+    # Feed critic result back to the fallback planner for quick-path tuning.
     plan = await components.planner.plan(user_message, session_id)
     await components.planner.record_feedback(session_id, plan, critic_evaluation.passed)
 
@@ -527,6 +454,12 @@ async def _components() -> MCPComponents:
         settings = load_settings()
         store = await create_memory_store(settings)
         embedding_model = create_embedding_model(settings)
+        retrieval_orchestrator = AgenticRetrievalOrchestrator(
+            store=store,
+            embedding_model=embedding_model,
+            memory_window_turns=settings.memory_window_turns,
+            semantic_memory_ttl_days=settings.semantic_memory_ttl_days,
+        )
         planner = HeuristicRetrievalPlanner(
             store=store,
             embedding_model=embedding_model,
@@ -599,6 +532,7 @@ async def _components() -> MCPComponents:
             settings=settings,
             store=store,
             embedding_model=embedding_model,
+            retrieval_orchestrator=retrieval_orchestrator,
             planner=planner,
             memory_service=memory_service,
             evaluation_service=evaluation_service,

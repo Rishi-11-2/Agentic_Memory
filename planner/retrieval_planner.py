@@ -1,9 +1,16 @@
-"""Heuristic retrieval planner ported from Java and extended with density scoring."""
+"""Retrieval orchestration primitives for Agentic Memory.
+
+The primary MCP path is client-orchestrated: Codex, Claude Code, Cline, or
+another MCP client decides which memory layers to query and when to perform
+multi-hop retrieval. The heuristic planner remains as a backward-compatible
+quick context builder and deterministic fallback.
+"""
 
 from __future__ import annotations
 
 import re
 from datetime import datetime, timedelta, timezone
+from typing import Any
 
 from core.models import (
     EpisodeRecord,
@@ -19,8 +26,152 @@ from model.embedding_model import EmbeddingModel
 from store.base import MemoryStore
 
 
+class AgenticRetrievalOrchestrator:
+    """Expose memory-layer tools for an MCP client agent to orchestrate.
+
+    This class intentionally does not call a hidden internal LLM. The LLM in the
+    MCP client is the agentic orchestrator; Agentic Memory only retrieves and
+    ranks the layers the client explicitly asks for.
+    """
+
+    def __init__(
+        self,
+        store: MemoryStore,
+        embedding_model: EmbeddingModel,
+        memory_window_turns: int = 10,
+        semantic_memory_ttl_days: int = 180,
+    ) -> None:
+        """Create a client-orchestrated retrieval toolkit."""
+        self._store = store
+        self._embedding_model = embedding_model
+        self._memory_window_turns = memory_window_turns
+        self._semantic_memory_ttl_days = semantic_memory_ttl_days
+
+    def manifest(self) -> dict[str, Any]:
+        """Describe the MCP-client orchestration contract and retrieval tools."""
+        return {
+            "orchestrator": "mcp_client_agent",
+            "agentic_contract": {
+                "who_reasons": "Codex, Claude Code, Cline, or the MCP client currently using this server.",
+                "server_role": "Expose durable memory-layer retrieval tools and rankings.",
+                "no_hidden_planner_llm": True,
+                "multi_hop_supported": True,
+            },
+            "recommended_flow": [
+                "Read the user query and decide which memory layers are relevant.",
+                "Call retrieve_memory_layer for one layer at a time, using refined queries when a result suggests a follow-up hop.",
+                "Prefer semantic_hierarchy for broad context, semantic for exact facts, procedural for reusable workflows, episodic for prior examples, and failure for known hazards.",
+                "Resolve conflicts by preferring explicit user-stated, high-confidence, pinned, and recent memories.",
+                "Synthesize only grounded memory into the final answer.",
+                "Call consolidate_turn after answering so the completed turn can be learned.",
+            ],
+            "layers": {
+                MemoryLayer.CONVERSATIONAL.value: "Recent session messages and rolling summaries. Use for active-thread continuity.",
+                MemoryLayer.SEMANTIC.value: "Flat durable facts, preferences, and system rules. Use for precise known facts.",
+                MemoryLayer.SEMANTIC_HIERARCHY.value: (
+                    "Aggregated semantic facets, summaries, and Q&A nodes. Use for broad preference or project-context hops."
+                ),
+                MemoryLayer.EPISODIC.value: "Similar completed turns with prompt, outcome, tools, and response. Use for prior examples.",
+                MemoryLayer.PROCEDURAL.value: "Reusable successful tool workflows. Use for multi-step implementation or analysis tasks.",
+                MemoryLayer.FAILURE.value: "Similar past tool failures. Use for cautions and known bad approaches.",
+            },
+            "tools": [
+                {
+                    "name": "retrieve_memory_layer",
+                    "arguments": {
+                        "query": "Natural language retrieval query chosen by the MCP client agent.",
+                        "layer": "conversational | semantic | semantic_hierarchy | episodic | procedural | failure",
+                        "session_id": "Required for conversational lookup; optional otherwise.",
+                        "top_k": "Maximum records to return.",
+                    },
+                },
+                {
+                    "name": "consolidate_turn",
+                    "arguments": {
+                        "session_id": "Current conversation session identifier.",
+                        "user_message": "The user's original message.",
+                        "assistant_response": "The MCP client agent's final response.",
+                        "tool_calls_json": "Optional JSON audit of tool calls made by the MCP client agent.",
+                        "new_facts": "Optional durable facts the MCP client agent wants to save.",
+                        "failure_summary": "Optional summary of failures worth remembering.",
+                        "quality_score": "Optional self-assessed quality score from 0 to 10.",
+                        "reasoning_summary": "Optional brief approach summary for episodic recall.",
+                    },
+                },
+            ],
+            "fallback": {
+                "name": "get_session_context",
+                "role": "Backward-compatible convenience context builder.",
+                "uses_heuristics": True,
+                "agentic": False,
+            },
+        }
+
+    async def retrieve_layer(
+        self,
+        query: str,
+        layer: MemoryLayer,
+        session_id: str = "",
+        top_k: int = 5,
+    ) -> dict[str, Any]:
+        """Retrieve the memory layer explicitly selected by the MCP client."""
+        limit = max(1, min(int(top_k), 25))
+        if layer == MemoryLayer.CONVERSATIONAL:
+            if not session_id:
+                raise ValueError("session_id is required for conversational retrieval")
+            summaries = await self._store.recent_summaries(session_id, min(2, limit))
+            records = await self._store.recent_conversation(session_id, min(limit, self._memory_window_turns * 2))
+            return {
+                "orchestrator": "mcp_client_agent",
+                "layer": layer.value,
+                "query": query,
+                "session_id": session_id,
+                "summaries": [summary.model_dump(mode="json") for summary in summaries],
+                "records": [record.model_dump(mode="json") for record in records],
+            }
+
+        embedding = await self._embedding_model.embed(query)
+        if layer == MemoryLayer.SEMANTIC:
+            records = _rank_semantic_records(
+                await self._store.search_semantic(
+                    embedding,
+                    limit,
+                    0.0,
+                    0.0,
+                    last_confirmed_after=self._semantic_cutoff(),
+                )
+            )[:limit]
+        elif layer == MemoryLayer.SEMANTIC_HIERARCHY:
+            records = _rank_semantic_hierarchy_records(
+                await self._store.search_semantic_hierarchy(embedding, limit, 0.0)
+            )[:limit]
+        elif layer == MemoryLayer.EPISODIC:
+            records = _rank_episodes(await self._store.search_episodes(embedding, limit, 0.0))[:limit]
+        elif layer == MemoryLayer.PROCEDURAL:
+            trigger_matches = await self._store.match_procedural_triggers(query, limit)
+            vector_matches = await self._store.search_procedural(embedding, limit, 0.0)
+            records = _rank_workflows(_dedupe_workflows(trigger_matches + vector_matches))[:limit]
+        elif layer == MemoryLayer.FAILURE:
+            records = _rank_failures(await self._store.search_failures(embedding, limit, 0.0))[:limit]
+        else:
+            raise ValueError(f"Unsupported memory layer: {layer.value}")
+
+        return {
+            "orchestrator": "mcp_client_agent",
+            "layer": layer.value,
+            "query": query,
+            "records": [record.model_dump(mode="json") for record in records],
+        }
+
+    def _semantic_cutoff(self) -> datetime | None:
+        """Return semantic TTL cutoff for retrieval, or None when disabled."""
+        if self._semantic_memory_ttl_days <= 0:
+            return None
+        return datetime.now(timezone.utc) - timedelta(days=self._semantic_memory_ttl_days)
+
+
 class HeuristicRetrievalPlanner:
-    """Choose memory layers with explicit heuristics before assembling actor context."""
+    """Fallback context builder using explicit heuristics before actor context assembly."""
 
     _preference_keywords = (
         "always",

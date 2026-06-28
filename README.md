@@ -3,20 +3,22 @@
 Persistent, self-learning memory for AI coding agents. Agentic Memory runs as an
 MCP server for Claude Code, Cline, Codex, and other MCP-compatible assistants.
 
-The default mode needs no LLM API key. Your assistant remains the Actor: it
-reasons, calls tools, and writes the user-facing response. Agentic Memory stores
-the turn, evaluates it with deterministic heuristics, and consolidates useful
-signals into long-term memory. You can optionally add an LLM provider for a
-stronger Critic or enable standalone Actor-Critic mode.
+The default mode needs no LLM API key. Your assistant remains the Actor and the
+retrieval orchestrator: it reasons over which memory layers to query, performs
+multi-hop retrieval through MCP tools, calls other tools, and writes the
+user-facing response. Agentic Memory stores the turn, evaluates it with
+deterministic heuristics, and consolidates useful signals into long-term memory.
+You can optionally add an LLM provider for a stronger Critic or enable
+standalone Actor-Critic mode.
 
 ## What It Provides
 
 - Multi-layer long-term memory for conversations, episodes, facts, semantic
   hierarchy summaries, workflows, and failures.
-- Two-tool MCP workflow: retrieve context before answering, consolidate after
-  answering.
-- External-orchestrator workflow where Codex, Claude Code, Cline, or another
-  MCP client can plan memory-layer tool calls directly.
+- MCP-client orchestrated retrieval where Codex, Claude Code, Cline, or another
+  client plans memory-layer calls directly.
+- Backward-compatible quick context tool for clients that do not need multi-hop
+  retrieval.
 - Deterministic zero-key mode for local use.
 - Optional Anthropic, OpenAI, or Groq Critic for deeper evaluation.
 - SQLite by default, with PostgreSQL/pgvector support for larger deployments.
@@ -34,7 +36,8 @@ turn.
 
 ```text
 MCP client (Codex / Claude Code / Cline)
-  -> get_session_context or retrieve_memory_layer
+  -> get_memory_tool_manifest
+  -> retrieve_memory_layer one or more times with refined queries
   -> user-facing reasoning and tool use
   -> consolidate_turn
   -> Agentic Memory evaluates, stores, aggregates, and tunes retrieval
@@ -46,7 +49,7 @@ The codebase is split into these parts:
 |---|---|---|
 | Adapter | `mcp_server.py`, `main.py` | Expose MCP tools and a small REST/debug API. |
 | Core | `core/memory_service.py`, `core/evaluation_service.py`, `core/models.py` | Build context, evaluate turns, consolidate memory, and define schemas. |
-| Planner | `planner/retrieval_planner.py` | Provide the quick-path heuristic retrieval planner and ranking. |
+| Planner | `planner/retrieval_planner.py` | Expose MCP-client orchestrated retrieval tools, ranking, and a fallback heuristic context builder. |
 | Store | `store/*` | Persist memory layers in SQLite or PostgreSQL/pgvector. |
 | Model | `model/*` | Provide embeddings and optional structured LLM clients for Critic/standalone mode. |
 | Runtime | `runtime/*` | Optional provider-backed standalone Actor-Critic loop and local tools. |
@@ -57,19 +60,25 @@ standalone Actor-Critic mode.
 
 ## Memory Loop
 
-Agents use Agentic Memory with two calls:
+Agents use Agentic Memory with an agentic retrieval loop:
 
 ```text
-1. get_session_context(user_message, session_id)
-   Returns relevant system rules, preferences, facts, workflows, recent
-   conversation, similar episodes, and past failures.
+1. get_memory_tool_manifest()
+   Inspect the available memory layers and retrieval contract.
 
-2. The agent answers the user.
+2. retrieve_memory_layer(query, layer, session_id?, top_k?)
+   Call this one or more times. The MCP client agent decides the layers,
+   query refinements, and whether another hop is needed.
 
-3. consolidate_turn(session_id, user_message, assistant_response, ...)
+3. The agent answers the user.
+
+4. consolidate_turn(session_id, user_message, assistant_response, ...)
    Saves the turn, evaluates quality, extracts durable facts, learns successful
    workflows, records failures, and tunes retrieval weights.
 ```
+
+`get_session_context(user_message, session_id)` remains as a convenience fallback
+for clients that want a single assembled context block.
 
 The system does not move one memory record from one layer into another. It
 derives higher-level records from a completed turn, keeps the source episode,
@@ -100,14 +109,19 @@ completed turn
 
 ## Retrieval Orchestration
 
-There are two retrieval paths:
+The primary retrieval path is MCP-client orchestrated:
 
-1. `get_session_context` is the quick path. It uses the local heuristic planner
-   plus vector search to assemble conversational, semantic, semantic hierarchy,
-   episodic, procedural, and failure context.
-2. `get_memory_tool_manifest` plus `retrieve_memory_layer` is the agentic path.
-   The MCP client itself acts as the LLM orchestrator, deciding which memory
-   layers to query, in what order, and how to reconcile the returned signals.
+1. `get_memory_tool_manifest` describes the retrieval contract and available
+   layers.
+2. `retrieve_memory_layer` retrieves exactly the layer requested by the MCP
+   client agent.
+3. Codex, Claude Code, Cline, or another MCP client decides the query order,
+   performs any multi-hop refinements, reconciles conflicts, and synthesizes the
+   answer.
+
+`get_session_context` is a backward-compatible quick path. It uses the local
+heuristic fallback planner plus vector search to assemble one context block, but
+it is not the CMA-style agentic path.
 
 For a CMA-style retrieval loop, Codex or Claude Code can do this:
 
@@ -125,7 +139,8 @@ user query
 Simple queries can use one layer. More complex or longitudinal questions can
 trigger several `retrieve_memory_layer` calls with refined queries. Agentic
 Memory provides the memory tools and ranking; the MCP client provides the
-reasoning loop.
+reasoning loop. There is no hidden planner LLM inside the MCP server for normal
+retrieval orchestration.
 
 ## Semantic Hierarchy
 
@@ -282,9 +297,10 @@ http://localhost:8001/sse
 
 ### MCP Mode, Zero Key
 
-This is the default mode. The external assistant is the Actor, and Agentic
-Memory uses deterministic evaluation for fact extraction, quality scoring,
-workflow detection, failure recording, and semantic hierarchy aggregation.
+This is the default mode. The MCP client agent is the Actor and retrieval
+orchestrator, and Agentic Memory uses deterministic evaluation for fact
+extraction, quality scoring, workflow detection, failure recording, and semantic
+hierarchy aggregation.
 
 ```bash
 .venv/bin/python mcp_server.py
@@ -320,9 +336,9 @@ This enables the extra MCP tool `run_autonomous_turn`.
 
 | Tool | Parameters | Purpose |
 |---|---|---|
-| `get_memory_tool_manifest` | none | Describe memory layers and retrieval-tool strategy for Codex/Claude-style external orchestration. |
-| `get_session_context` | `user_message`, `session_id` | Retrieve memory-enriched context before the agent answers. |
-| `retrieve_memory_layer` | `query`, `layer`, `session_id?`, `top_k?` | Query one memory layer so the external MCP client can plan multi-step retrieval. |
+| `get_memory_tool_manifest` | none | Describe the MCP-client agentic retrieval contract and available memory layers. |
+| `get_session_context` | `user_message`, `session_id` | Retrieve a fallback memory-enriched context block before the agent answers. |
+| `retrieve_memory_layer` | `query`, `layer`, `session_id?`, `top_k?` | Query one memory layer selected by the MCP client agent for multi-step retrieval. |
 | `consolidate_turn` | `session_id`, `user_message`, `assistant_response`, `tool_calls_json?`, `new_facts?`, `failure_summary?`, `quality_score?`, `reasoning_summary?` | Save and learn from a completed turn. |
 | `search_memory` | `query`, `layers?`, `top_k?` | Search semantic, semantic hierarchy, episodic, procedural, and failure memory by similarity. |
 | `get_conversation_history` | `session_id`, `last_n?` | Fetch recent conversation messages. |
@@ -440,9 +456,10 @@ Run the behavioral harness:
 python -m tests.evaluation_harness
 ```
 
-The harness covers heuristic evaluation, semantic deduplication, semantic
-hierarchy creation and retrieval, pin/stale behavior, persisted planner
-feedback, context rendering, and failure recall.
+The harness covers heuristic evaluation, MCP-client orchestrated retrieval,
+semantic deduplication, semantic hierarchy creation and retrieval, pin/stale
+behavior, persisted fallback planner feedback, context rendering, and failure
+recall.
 
 ## Project Structure
 
@@ -451,7 +468,7 @@ feedback, context rendering, and failure recall.
 +-- main.py                    # FastAPI admin/debug API
 +-- config.py                  # Environment settings and JSON logging
 +-- core/                      # Evaluation, consolidation, and Pydantic models
-+-- planner/                   # Retrieval planning and feedback weights
++-- planner/                   # Client-orchestrated retrieval and fallback planning
 +-- store/                     # SQLite and PostgreSQL memory stores
 +-- model/                     # Embeddings and LLM provider clients
 +-- runtime/                   # Optional standalone Actor-Critic loop and tools

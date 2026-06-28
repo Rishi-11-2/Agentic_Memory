@@ -28,7 +28,7 @@ from core.models import (
     ToolInvocation,
 )
 from model.embedding_model import HashEmbeddingModel
-from planner.retrieval_planner import HeuristicRetrievalPlanner
+from planner.retrieval_planner import AgenticRetrievalOrchestrator, HeuristicRetrievalPlanner
 from store.sqlite_store import SQLiteMemoryStore
 
 
@@ -43,6 +43,7 @@ class AgenticMemoryHarness(unittest.IsolatedAsyncioTestCase):
         self.store = await SQLiteMemoryStore.create(self.db_path)
         self.embedding = HashEmbeddingModel()
         self.service = AgenticMemoryService(self.store, self.embedding, memory_window_turns=3)
+        self.orchestrator = AgenticRetrievalOrchestrator(self.store, self.embedding, memory_window_turns=3)
         self.planner = HeuristicRetrievalPlanner(self.store, self.embedding, memory_window_turns=3)
 
     async def asyncTearDown(self) -> None:
@@ -144,6 +145,30 @@ class AgenticMemoryHarness(unittest.IsolatedAsyncioTestCase):
         self.assertGreater(weights["semantic"], 1.0)
         fresh_plan = await fresh_planner.plan("I prefer bullet lists", "feedback")
         self.assertTrue(fresh_plan.query_semantic)
+
+    async def test_mcp_client_agent_orchestrates_layer_retrieval(self) -> None:
+        manifest = self.orchestrator.manifest()
+        self.assertEqual(manifest["orchestrator"], "mcp_client_agent")
+        self.assertTrue(manifest["agentic_contract"]["no_hidden_planner_llm"])
+        self.assertFalse(manifest["fallback"]["agentic"])
+
+        record = SemanticMemoryRecord(
+            fact_type=SemanticFactType.PREFERENCE,
+            content="User preference: always use bullet lists",
+            embedding=await self.embedding.embed("always use bullet lists"),
+            confidence_score=0.9,
+            source="user_stated",
+        )
+        await self.store.insert_semantic(record)
+
+        result = await self.orchestrator.retrieve_layer(
+            query="How should answers be formatted?",
+            layer=MemoryLayer.SEMANTIC,
+            top_k=3,
+        )
+        self.assertEqual(result["orchestrator"], "mcp_client_agent")
+        self.assertEqual(result["layer"], MemoryLayer.SEMANTIC.value)
+        self.assertTrue(any("bullet lists" in item["content"] for item in result["records"]))
 
     async def test_context_renders_multiple_workflows_and_known_facts(self) -> None:
         workflows = [
