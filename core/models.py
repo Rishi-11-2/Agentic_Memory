@@ -118,6 +118,7 @@ class EpisodeRecord(BaseModel):
     """Persist an append-only record of a complete actor turn."""
 
     episode_id: str = Field(default_factory=lambda: str(uuid4()))
+    session_id: str = ""
     prompt_text: str
     reasoning_summary: str = ""
     prompt_embedding: list[float] = Field(default_factory=list)

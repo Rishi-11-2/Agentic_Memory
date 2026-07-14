@@ -58,7 +58,9 @@ Provisional scoring is deliberately not authoritative. When it is used, the
 episode is marked with `evaluation_source="heuristic_provisional"` and
 `needs_agent_rescore=true`; deferred learning that depends on a trusted score,
 such as saving a successful procedural workflow, is applied only after the MCP
-client agent calls `rescore_episode`.
+client agent calls `rescore_episode`. The originating `session_id` is stored on
+the episode, so retrieval-feedback weights are also deferred and then updated
+from the client-agent score without relying on a caller-supplied session id.
 
 ## Retrieval
 

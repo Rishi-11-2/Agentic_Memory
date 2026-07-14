@@ -6,11 +6,15 @@ Run with:
 
 from __future__ import annotations
 
+import json
 import os
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
+from typing import cast
 
+import mcp_server
+from config import Settings
 from core.evaluation_service import AutoEvaluationService
 from core.memory_service import AgenticMemoryService
 from core.models import (
@@ -286,6 +290,7 @@ class AgenticMemoryHarness(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(turn_index, 0)
         stored = await self.store.get_episode(episode_id)
         assert stored is not None
+        self.assertEqual(stored.session_id, "rescore")
         self.assertEqual(stored.evaluation_source, "heuristic_provisional")
         self.assertTrue(stored.needs_agent_rescore)
         self.assertEqual(await self.store.count_layer(MemoryLayer.PROCEDURAL), 0)
@@ -305,6 +310,58 @@ class AgenticMemoryHarness(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(updated.evaluation_score, final_score.overall_score)
         self.assertTrue(any("Updated episodic episode evaluation" in write for write in writes))
         self.assertGreaterEqual(await self.store.count_layer(MemoryLayer.PROCEDURAL), 1)
+
+    async def test_mcp_rescore_defers_retrieval_feedback_to_agent_score(self) -> None:
+        await self.store.insert_semantic(
+            SemanticMemoryRecord(
+                fact_type=SemanticFactType.PREFERENCE,
+                content="User preference: always use bullet lists",
+                embedding=await self.embedding.embed("always use bullet lists"),
+                confidence_score=0.9,
+                source="user_stated",
+            )
+        )
+        previous_components = mcp_server._COMPONENTS
+        mcp_server._COMPONENTS = mcp_server.MCPComponents(
+            settings=cast(Settings, object()),
+            store=self.store,
+            embedding_model=self.embedding,
+            retrieval_orchestrator=self.orchestrator,
+            planner=self.planner,
+            memory_service=self.service,
+            evaluation_service=AutoEvaluationService(),
+        )
+        try:
+            provisional_payload = json.loads(
+                await mcp_server.consolidate_turn(
+                    session_id="mcp-feedback",
+                    user_message="I prefer bullet lists for summaries.",
+                    assistant_response="I will use bullet lists for summaries.",
+                )
+            )
+            self.assertTrue(provisional_payload["needs_agent_rescore"])
+            self.assertIsNone(await self.store.get_retrieval_weights("mcp-feedback"))
+
+            final_evaluation = {
+                "factual_accuracy": 9,
+                "preference_adherence": 9,
+                "tool_efficiency": 9,
+                "hallucination_risk": 9,
+                "workflow_quality": 8,
+                "save_workflow": False,
+            }
+            rescore_payload = json.loads(
+                await mcp_server.rescore_episode(
+                    episode_id=provisional_payload["episode_id"],
+                    agent_evaluation_json=json.dumps(final_evaluation),
+                )
+            )
+            self.assertFalse(rescore_payload["needs_agent_rescore"])
+            weights = await self.store.get_retrieval_weights("mcp-feedback")
+            assert weights is not None
+            self.assertGreater(weights["semantic"], 1.0)
+        finally:
+            mcp_server._COMPONENTS = previous_components
 
     async def test_context_renders_multiple_workflows_and_known_facts(self) -> None:
         workflows = [

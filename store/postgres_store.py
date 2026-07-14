@@ -184,11 +184,11 @@ class PostgresMemoryStore(MemoryStore):
 
         async with self._pool.acquire() as conn:
             await conn.execute(
-                f"INSERT INTO am_episodic_memory (episode_id, prompt_text, reasoning_summary, {vec_col}, tool_sequence, "
+                f"INSERT INTO am_episodic_memory (episode_id, session_id, prompt_text, reasoning_summary, {vec_col}, tool_sequence, "
                 "final_response, outcome, error_trace, latency_ms, evaluation_score, evaluation_source, "
                 "needs_agent_rescore, evaluated_at, timestamp) "
-                f"VALUES ($1, $2, $3, $4::vector, $5::jsonb, $6, $7, $8, $9, $10, $11, $12, $13, $14)",
-                episode.episode_id, episode.prompt_text,
+                f"VALUES ($1, $2, $3, $4, $5::vector, $6::jsonb, $7, $8, $9, $10, $11, $12, $13, $14, $15)",
+                episode.episode_id, episode.session_id, episode.prompt_text,
                 episode.reasoning_summary, _vec_literal(vec_val), tool_seq,
                 episode.final_response, episode.outcome.value, episode.error_trace,
                 episode.latency_ms, episode.evaluation_score, episode.evaluation_source,
@@ -721,6 +721,7 @@ class PostgresMemoryStore(MemoryStore):
         embedding = _parse_pg_vector(row.get("prompt_embedding") or row.get("prompt_embedding_hash"))
         return EpisodeRecord(
             episode_id=str(row["episode_id"]),
+            session_id=str(row.get("session_id") or ""),
             prompt_text=str(row["prompt_text"]),
             reasoning_summary=str(row.get("reasoning_summary") or ""),
             prompt_embedding=embedding,
@@ -859,6 +860,10 @@ async def _migrate_schema(conn: asyncpg.Connection) -> None:
     await conn.execute(
         "ALTER TABLE IF EXISTS am_episodic_memory "
         "ADD COLUMN IF NOT EXISTS reasoning_summary text NOT NULL DEFAULT ''"
+    )
+    await conn.execute(
+        "ALTER TABLE IF EXISTS am_episodic_memory "
+        "ADD COLUMN IF NOT EXISTS session_id text NOT NULL DEFAULT ''"
     )
     await conn.execute(
         "ALTER TABLE IF EXISTS am_episodic_memory "

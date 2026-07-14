@@ -28,6 +28,7 @@ create table if not exists am_conversation_summaries (
 
 create table if not exists am_episodic_memory (
     episode_id uuid primary key default gen_random_uuid(),
+    session_id text not null default '',
     prompt_text text not null,
     reasoning_summary text not null default '',
     prompt_embedding vector(384),
@@ -48,6 +49,8 @@ create table if not exists am_episodic_memory (
 
 alter table am_episodic_memory
     add column if not exists reasoning_summary text not null default '';
+alter table am_episodic_memory
+    add column if not exists session_id text not null default '';
 alter table am_episodic_memory
     add column if not exists evaluation_score double precision check (
         evaluation_score is null or (evaluation_score >= 0.0 and evaluation_score <= 10.0)

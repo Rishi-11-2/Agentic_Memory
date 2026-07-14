@@ -90,7 +90,8 @@ another MCP client scores its completed answer and passes `agent_evaluation_json
 to `consolidate_turn`. If that score is missing, the server invents provisional
 scores so consolidation does not fail, returns `needs_agent_rescore=true` plus
 `episode_id`, and expects the client to call `rescore_episode` with the final
-agent score.
+agent score. Provisional scores never update the fallback planner's persisted
+retrieval-feedback weights; those are applied only after the final agent score.
 
 The system does not move one memory record from one layer into another. It
 derives higher-level records from a completed turn, keeps the source episode,

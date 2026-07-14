@@ -73,7 +73,7 @@ class AgenticRetrievalOrchestrator:
                 "primary": "Codex, Claude Code, Cline, or the MCP client agent scores its completed turn.",
                 "server_bootstrap": (
                     "If agent_evaluation_json is omitted, the server invents provisional scores only "
-                    "to keep consolidation alive."
+                    "to keep consolidation alive; provisional scores never update retrieval-feedback weights."
                 ),
                 "rescore": (
                     "When needs_agent_rescore is true, the MCP client should score the turn and call "
@@ -177,7 +177,7 @@ class AgenticRetrievalOrchestrator:
                     "arguments": {
                         "episode_id": "Episode id returned by consolidate_turn.",
                         "agent_evaluation_json": "Typed 0-10 scoring produced by the MCP client agent.",
-                        "session_id": "Optional session id for retrieval-feedback tuning.",
+                        "session_id": "Optional compatibility fallback for episodes saved before session ids were persisted.",
                     },
                 },
             ],

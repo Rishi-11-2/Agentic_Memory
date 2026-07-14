@@ -214,9 +214,11 @@ async def consolidate_turn(
         needs_agent_rescore=evaluation_result.needs_agent_rescore,
     )
 
-    # Feed critic result back to the fallback planner for quick-path tuning.
-    plan = await components.planner.plan(user_message, session_id)
-    await components.planner.record_feedback(session_id, plan, critic_evaluation.passed)
+    # Provisional scores must not influence durable fallback-planner feedback.
+    # The agent-authoritative rescore applies it later to the originating session.
+    if not evaluation_result.needs_agent_rescore:
+        plan = await components.planner.plan(user_message, session_id)
+        await components.planner.record_feedback(session_id, plan, critic_evaluation.passed)
 
     return json.dumps(
         {
@@ -251,7 +253,8 @@ async def rescore_episode(
     - agent_evaluation_json: JSON object using CriticEvaluation fields:
       factual_accuracy, preference_adherence, tool_efficiency,
       hallucination_risk, workflow_quality, save_workflow, failure_summary.
-    - session_id: Optional session identifier for retrieval feedback tuning.
+    - session_id: Optional compatibility fallback for episodes created before
+      session ids were stored on episodic records.
     """
     components = await _components()
     parsed_agent_evaluation = json.loads(agent_evaluation_json) if agent_evaluation_json.strip() else None
@@ -283,9 +286,17 @@ async def rescore_episode(
     if updated_episode is None:
         return json.dumps({"found": False, "episode_id": episode_id}, ensure_ascii=False)
 
-    if session_id:
-        plan = await components.planner.plan(existing.prompt_text, session_id)
-        await components.planner.record_feedback(session_id, plan, evaluation_result.evaluation.passed)
+    needs_deferred_feedback = (
+        existing.needs_agent_rescore or existing.evaluation_source == "heuristic_provisional"
+    )
+    feedback_session_id = existing.session_id or session_id
+    if needs_deferred_feedback and feedback_session_id:
+        plan = await components.planner.plan(existing.prompt_text, feedback_session_id)
+        await components.planner.record_feedback(
+            feedback_session_id,
+            plan,
+            evaluation_result.evaluation.passed,
+        )
 
     return json.dumps(
         {

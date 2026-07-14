@@ -57,6 +57,7 @@ CREATE TABLE IF NOT EXISTS am_conversation_summaries (
 
 CREATE TABLE IF NOT EXISTS am_episodic_memory (
     episode_id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL DEFAULT '',
     prompt_text TEXT NOT NULL,
     reasoning_summary TEXT NOT NULL DEFAULT '',
     prompt_embedding TEXT,
@@ -280,11 +281,11 @@ class SQLiteMemoryStore(MemoryStore):
     async def save_episode(self, episode: EpisodeRecord) -> EpisodeRecord:
         """Persist an append-only episodic memory record."""
         await self._db.execute(
-            "INSERT INTO am_episodic_memory (episode_id, prompt_text, reasoning_summary, prompt_embedding, "
+            "INSERT INTO am_episodic_memory (episode_id, session_id, prompt_text, reasoning_summary, prompt_embedding, "
             "tool_sequence, final_response, outcome, error_trace, latency_ms, evaluation_score, "
             "evaluation_source, needs_agent_rescore, evaluated_at, timestamp) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (episode.episode_id, episode.prompt_text,
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (episode.episode_id, episode.session_id, episode.prompt_text,
              episode.reasoning_summary,
              json.dumps(episode.prompt_embedding) if episode.prompt_embedding else None,
              json.dumps([tool.model_dump(mode="json") for tool in episode.tool_sequence]),
@@ -773,6 +774,7 @@ class SQLiteMemoryStore(MemoryStore):
         embedding = json.loads(row["prompt_embedding"]) if row["prompt_embedding"] else []
         return EpisodeRecord(
             episode_id=str(row["episode_id"]),
+            session_id=str(row["session_id"] or ""),
             prompt_text=str(row["prompt_text"]),
             reasoning_summary=str(row["reasoning_summary"] or ""),
             prompt_embedding=embedding,
@@ -878,6 +880,8 @@ async def _migrate_schema(db: aiosqlite.Connection) -> None:
         await db.execute(
             "ALTER TABLE am_episodic_memory ADD COLUMN reasoning_summary TEXT NOT NULL DEFAULT ''"
         )
+    if "session_id" not in episode_columns:
+        await db.execute("ALTER TABLE am_episodic_memory ADD COLUMN session_id TEXT NOT NULL DEFAULT ''")
     if "evaluation_score" not in episode_columns:
         await db.execute(
             "ALTER TABLE am_episodic_memory ADD COLUMN evaluation_score REAL "

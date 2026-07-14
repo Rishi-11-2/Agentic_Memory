@@ -201,6 +201,7 @@ class AgenticMemoryService:
         prompt_embedding = await self._embedding_model.embed(prompt)
         outcome = _episode_outcome(actor_result.tool_calls, critic_evaluation)
         episode = EpisodeRecord(
+            session_id=session_id,
             prompt_text=prompt,
             reasoning_summary=actor_result.reasoning,
             prompt_embedding=prompt_embedding,
